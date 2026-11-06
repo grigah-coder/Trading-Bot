@@ -1,4 +1,4 @@
-# 🚀 MLTraderProMax
+# 🚀 TraderProMax
 
 An asynchronous, production-ready automated algorithmic trading bot built in Python. It integrates **Lumibot** for broker execution (Alpaca), **FinBERT** for real-time financial news sentiment analysis, and multi-threaded processing for lightning-fast performance.
 
@@ -20,7 +20,7 @@ An asynchronous, production-ready automated algorithmic trading bot built in Pyt
 
 ## 📂 Project Structure
 ```text
-MLTradingBot/
+TradingBot/
 │
 ├── tradingbot.py         # Main entry point and strategy loop
 ├── config.py             # Centralised environment and strategy configuration
