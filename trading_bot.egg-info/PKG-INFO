@@ -1,0 +1,78 @@
+Metadata-Version: 2.4
+Name: trading-bot
+Version: 0.1.0
+Summary: A modular foundation for an Alpaca paper-trading bot
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: alpaca-py<1,>=0.45
+Requires-Dist: exchange-calendars<5,>=4.13
+Provides-Extra: test
+Requires-Dist: pytest<10,>=8; extra == "test"
+
+# Trading Bot
+
+A modular Python foundation for an Alpaca paper-trading bot. It includes
+validated configuration, lifecycle state, a dependency-injected engine,
+failure recovery, and an XNYS-aware scheduler. Strategy evaluation, risk checks,
+and order submission are interfaces supplied to the engine; no strategy or live
+broker execution is implemented here.
+
+## Requirements
+
+- Python 3.11 or newer
+- Alpaca paper-trading credentials supplied through the environment when a
+  broker integration is added
+
+## Setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+```
+
+Set values in `.env`, then export them into the process environment using your
+shell or a local environment manager. The application reads environment
+variables and does not load `.env` files itself.
+
+`ALPACA_PAPER` defaults to `true`. Keep it enabled for the intended paper
+environment. Never commit `.env` or paste credentials into source files.
+
+## Project layout
+
+| Directory | Responsibility |
+| --- | --- |
+| `config/` | Typed, environment-based settings |
+| `core/` | Shared infrastructure such as retry behavior |
+| `data/` | Data access and in-memory caching |
+| `strategies/` | Reserved for future strategy implementations |
+| `indicators/` | Reserved for future technical indicators |
+| `signals/` | Reserved for future signal models |
+| `risk/` | Reserved for future risk policies |
+| `execution/` | Reserved for a future paper broker adapter |
+| `portfolio/` | Portfolio state and protective order tracking |
+| `storage/` | Persistent trade and portfolio records |
+| `backtesting/` | Reserved for future simulation tools |
+| `monitoring/` | Reserved for future health and metrics reporting |
+| `tests/` | Automated checks |
+| `scripts/` | Developer and maintenance commands |
+
+The engine and application lifecycle live in `core/`. The scheduler uses the
+XNYS exchange calendar for holidays, daylight-saving changes, regular sessions,
+and early closes. Components are injected when the application starts, and
+startup health checks run before entering `RUNNING`.
+
+Configuration is split into broker, trading, strategy, risk, database, and
+logging settings. Invalid values fail during startup. `ALPACA_PAPER` must remain
+true in this phase.
+
+## Development
+
+```bash
+python -m pytest
+```
+
+The runtime dependency is `exchange-calendars` for real exchange sessions;
+pytest is the only development dependency. Alpaca's SDK will be added with the
+broker adapter when order execution is introduced.

@@ -1,0 +1,5 @@
+alpaca-py<1,>=0.45
+exchange-calendars<5,>=4.13
+
+[test]
+pytest<10,>=8
