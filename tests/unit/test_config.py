@@ -45,6 +45,8 @@ def test_env_file_is_not_overwritten_by_existing_env(monkeypatch, tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text("ALPACA_API_KEY=from_file\nALPACA_DATA_FEED=sip\n", encoding="utf-8")
     monkeypatch.setenv("ALPACA_API_KEY", "from_env")
+    # Ensure the file value can load: delete any polluted env from prior tests.
+    monkeypatch.delenv("ALPACA_DATA_FEED", raising=False)
     applied = _load_dotenv(env_file)
     assert "ALPACA_API_KEY" not in applied  # existing env wins
     assert os.environ["ALPACA_API_KEY"] == "from_env"

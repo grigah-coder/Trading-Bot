@@ -1,0 +1,8 @@
+# Activate venv (if not already)
+source venv/bin/activate
+
+# Run the paper-trading engine (requires real credentials in .env)
+python -m trading_bot
+
+# Run tests
+pytest -q

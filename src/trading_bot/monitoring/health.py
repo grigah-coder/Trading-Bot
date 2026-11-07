@@ -78,7 +78,11 @@ class HealthMonitor:
         all_ok = True
         for name, check in self.components.items():
             try:
-                health = check() if callable(check) else dict(check or {})
+                result = check() if callable(check) else dict(check or {})
+                if isinstance(result, dict):
+                    health = result
+                else:
+                    health = {"ok": bool(result)}
             except Exception as exc:  # noqa: BLE001
                 health = {"ok": False, "error": str(exc)}
                 logger.warning("Health check %s failed: %s", name, exc)
