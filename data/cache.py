@@ -63,3 +63,13 @@ class TTLCache:
                     if oldest is not None:
                         self._store.pop(oldest, None)
             self._store[key] = (time.monotonic() + ttl, value)
+
+    def delete(self, key: Any) -> bool:
+        """Remove one cached entry and report whether it existed."""
+        with self._lock:
+            return self._store.pop(key, None) is not None
+
+    def clear(self) -> None:
+        """Invalidate every cached value."""
+        with self._lock:
+            self._store.clear()

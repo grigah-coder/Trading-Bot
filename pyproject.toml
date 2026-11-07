@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "0.1.0"
+description = "A modular foundation for an Alpaca paper-trading bot"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["alpaca-py>=0.45,<1", "exchange-calendars>=4.13,<5", "requests>=2.31,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "core*", "data*", "execution*", "indicators*", "portfolio*", "risk*", "signals*", "storage*", "strategies*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

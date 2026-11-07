@@ -1,6 +1,32 @@
+# Python environments and generated files
+.venv/
 venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local configuration and credentials
 .env
+.env.*
+!.env.example
+.aws/
+secrets/
+*.pem
+*.key
+
+# Runtime artifacts and historical trade records
 logs/
-.cache/
 *.log
+trade_ledger.json
+data/cache/
+data/*.sqlite
+data/*.sqlite3
+data/*.db
+
+# Editor and OS files
+.idea/
+.DS_Store
+Thumbs.db
