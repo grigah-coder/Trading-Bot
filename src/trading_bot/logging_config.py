@@ -81,11 +81,11 @@ def configure_logging(
     backup_count = backup_count if backup_count is not None else 5
     try:
         from trading_bot.config import (  # type: ignore
-            LOG_LEVEL,
+            LOG_BACKUP_COUNT,
             LOG_DIR,
             LOG_FILE,
+            LOG_LEVEL,
             LOG_MAX_BYTES,
-            LOG_BACKUP_COUNT,
         )
 
         resolved_level = _coerce_level(level if level is not None else LOG_LEVEL)
