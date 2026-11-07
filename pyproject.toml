@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-bot"
+version = "2.0.0"
+description = "Reliable, risk-controlled algorithmic trading system for Alpaca paper trading"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "grigah-coder" },
+]
+license = { text = "MIT" }
+keywords = ["algorithmic-trading", "alpaca", "quantitative", "paper-trading", "risk-management"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+dependencies = [
+    "alpaca-py>=0.45.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "python-dotenv>=1.0.0",
+    "PyYAML>=6.0",
+    "requests>=2.31",
+    "tzdata>=2023.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.10",
+    "coverage>=7.0",
+    "ruff>=0.8",
+]
+test = [
+    "pytest>=8.0",
+    "pytest-mock>=3.10",
+    "coverage>=7.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["trading_bot*"]
+
+[tool.setuptools.package-data]
+trading_bot = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "D", "B"]
+ignore = ["E501", "B008"]
+fixable = ["F", "I", "D"]
+
+[tool.ruff.isort]
+known-first-party = ["trading_bot"]
+
+[tool.coverage.run]
+source = ["trading_bot"]
+branch = true
+omit = [
+    "src/trading_bot/__init__.py",
+    "tests/*",
+]

@@ -1,10 +1,9 @@
 """Lightweight, thread-safe, in-memory TTL cache.
 
-Used to avoid redundant work (network calls to Alpaca News, FinBERT
-inference, and technical-indicator maths) within a short time window.
+Used to avoid redundant work (network calls, inference, indicator maths)
+within a short time window.
 
-No third-party dependencies: pure standard library so it works with the
-existing ``requirements.txt``.
+No third-party dependencies: pure standard library.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ class TTLCache:
     """A bounded cache where every entry expires after ``ttl`` seconds.
 
     * Thread-safe: all mutations happen under a re-entrant lock so it can be
-      shared between the ``ThreadPoolExecutor`` workers.
+      shared between worker threads.
     * Bounded: once ``maxsize`` is reached, expired entries are purged and,
       if still full, the oldest inserted entry is evicted.
     * Monotonic clock: immune to system-clock changes.

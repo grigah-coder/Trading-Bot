@@ -7,11 +7,11 @@ Sets up a single root configuration with:
   growing without bound.
 
 Both handlers share one formatter that includes a timestamp, level, logger
-name and thread name (important now that symbols are analysed concurrently).
+name and thread name.
 
 Usage::
 
-    from logging_setup import configure_logging
+    from trading_bot.logging_config import configure_logging
 
     configure_logging()          # call once, early (idempotent)
     logger = logging.getLogger(__name__)
@@ -72,9 +72,15 @@ def configure_logging(
     if _configured and not force:
         return root
 
-    # Import lazily to avoid a circular import with config.
+    # Import configuration lazily so this module can be configured before the
+    # application config module is available.
+    resolved_level = logging.INFO
+    log_dir = log_dir or "logs"
+    log_file = log_file or "trading_bot.log"
+    max_bytes = max_bytes if max_bytes is not None else 5_000_000
+    backup_count = backup_count if backup_count is not None else 5
     try:
-        from config import (  # type: ignore
+        from trading_bot.config import (  # type: ignore
             LOG_LEVEL,
             LOG_DIR,
             LOG_FILE,
@@ -90,7 +96,7 @@ def configure_logging(
     except Exception:  # pragma: no cover - config should always exist
         resolved_level = _coerce_level(level if level is not None else "INFO")
         log_dir = log_dir or "logs"
-        log_file = log_file or "tradingbot.log"
+        log_file = log_file or "trading_bot.log"
         max_bytes = max_bytes if max_bytes is not None else 5_000_000
         backup_count = backup_count if backup_count is not None else 5
 

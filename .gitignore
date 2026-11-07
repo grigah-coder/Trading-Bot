@@ -1,6 +1,43 @@
+# Bytecode / virtual environments
 venv/
+.venv/
 __pycache__/
+*.pyc
+*.pyo
+
+# Credentials (never commit real secrets)
 .env
+.env.local
+
+# Runtime data and logs
 logs/
-.cache/
 *.log
+data/
+*.sqlite
+*.sqlite3
+*.db
+
+# Cache
+.cache/
+.ipynb_checkpoints/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Packaging
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Python
+.python-version
+mypy.ini
+.pytest_cache/
+.coverage
+htmlcov/

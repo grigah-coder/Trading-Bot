@@ -1,7 +1,7 @@
 """Retry / backoff helpers for flaky network calls and API rate limits.
 
-Provides :func:`call_with_retry`, which applies **exponential backoff with
-full jitter** and understands the error types that matter for this bot:
+Provides :func:`call_with_retry`, which applies exponential backoff with full
+jitter and understands the error types that matter for this bot:
 
 * network-level failures (``ConnectionError``/``Timeout``/requests errors),
 * Alpaca ``APIError`` with a retryable HTTP status (429 rate-limit, 5xx), and
@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 
 # --- Optional Alpaca imports (kept soft so the module stays importable) -----
 try:  # pragma: no cover - depends on install
-    from alpaca.common.exceptions import APIError, RetryException # pyright: ignore[reportMissingImports]
+    from alpaca.common.exceptions import APIError, RetryException  # pyright: ignore[reportMissingImports]
 except Exception:  # pragma: no cover
     APIError = None  # type: ignore
     RetryException = None  # type: ignore
 
 try:  # pragma: no cover
-    import requests # pyright: ignore[reportMissingModuleSource]
+    import requests  # pyright: ignore[reportMissingModuleSource]
 
     _REQUESTS_ERRORS: Tuple[Type[BaseException], ...] = (
         requests.exceptions.ConnectionError,
@@ -78,12 +78,10 @@ def is_retryable(exc: BaseException) -> bool:
     if RetryException is not None and isinstance(exc, RetryException):
         return True
 
-    # Any exception exposing an HTTP status code is classified by that code.
     code = _status_code(exc)
     if code is not None:
         return code in RETRYABLE_HTTP_CODES
 
-    # Alpaca APIError without a resolvable status: retry only if transient.
     if APIError is not None and isinstance(exc, APIError):
         return is_rate_limit(exc) or "timeout" in str(exc).lower()
 

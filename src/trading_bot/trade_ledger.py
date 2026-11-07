@@ -1,16 +1,16 @@
 """Persistent trade ledger used by the end-of-day report.
 
-Alpaca does not expose realised P/L per filled order, so the bot keeps its own
-small FIFO ledger:
+Alpaca does not expose realised P/L per filled order, so the system keeps its
+own small FIFO ledger:
 
 * every **buy** fill opens a lot (quantity + fill price),
 * every **sell** fill consumes lots for that symbol and records the realised
   profit/loss of the matched shares.
 
-The ledger is written atomically to ``TRADE_LEDGER_FILE`` so a restart during
-the day does not lose the trade outcomes. Open lots are *not* cleared at
-midnight: a position bought yesterday and sold today still produces a correct
-result for today's report. Closed trades are pruned after ``keep_days``.
+The ledger is written atomically to its JSON file so a restart during the day
+does not lose the trade outcomes. Open lots are *not* cleared at midnight: a
+position bought yesterday and sold today still produces a correct result for
+today's report. Closed trades are pruned after ``keep_days``.
 
 The module is dependency-free (standard library only) and thread-safe; fills
 arrive from the broker callback thread while the main loop may read stats.
@@ -73,7 +73,7 @@ def _fill_sort_key(fill: Dict[str, Any]) -> float:
         return 0.0
 
 
-class DailyTradeLedger:
+class TradeLedger:
     """FIFO ledger of open lots and realised sell trades.
 
     Parameters
@@ -387,8 +387,8 @@ class DailyTradeLedger:
     def reconcile_fills(self, fills: Iterable[Dict[str, Any]]) -> int:
         """Import broker fills in chronological order, skipping duplicates.
 
-        Used at market close so bracket exit legs (which lumibot does not
-        report through ``on_filled_order``) are included in the daily win/loss
+        Used at market close so bracket exit legs (which are not reported
+        through the real-time callback) are included in the daily win/loss
         counts. Returns the number of newly recorded fills.
         """
         ordered = sorted(

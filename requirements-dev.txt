@@ -1,0 +1,7 @@
+# Development and test dependencies.
+-r requirements.txt
+
+pytest>=8.0
+pytest-mock>=3.10
+coverage>=7.0
+ruff>=0.8
