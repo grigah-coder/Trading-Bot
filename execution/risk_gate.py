@@ -18,6 +18,7 @@ from execution.broker import (
     OrderSubmissionUnknown,
     TimeInForce,
 )
+from core.trading_gate import TradingGate
 from risk.engine import RiskEngine
 from risk.exceptions import CircuitBreakerActive
 from risk.models import PortfolioRiskContext, TradeProposal

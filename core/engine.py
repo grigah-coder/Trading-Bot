@@ -14,6 +14,7 @@ from core.exceptions import (
 )
 from core.market_calendar import MarketSession
 from core.state import ApplicationState, StateMachine
+from core.trading_gate import TradingGate
 
 SnapshotT = TypeVar("SnapshotT")
 SignalT = TypeVar("SignalT")
@@ -88,6 +89,7 @@ class CycleResult:
     risk_approved: bool
     order_executed: bool
     halted: bool
+    trading_blocked: bool = False
 
 
 class TradingEngine(Generic[SnapshotT, SignalT]):
@@ -98,6 +100,7 @@ class TradingEngine(Generic[SnapshotT, SignalT]):
         components: EngineComponents[SnapshotT, SignalT],
         *,
         state: StateMachine,
+        trading_gate: TradingGate | None = None,
     ) -> None:
         if getattr(components.order_executor, "risk_gate_enforced", False) is not True:
             raise RiskGateRequired(
@@ -105,6 +108,7 @@ class TradingEngine(Generic[SnapshotT, SignalT]):
             )
         self.components = components
         self.state = state
+        self.trading_gate = trading_gate
 
     def health_check(self) -> None:
         for name, component in self.components.lifecycle_order():
@@ -132,18 +136,19 @@ class TradingEngine(Generic[SnapshotT, SignalT]):
             valid = False
             approved = False
             executed = False
+            blocked = bool(self.trading_gate is not None and self.trading_gate.blocked)
             if signal is not None:
                 valid = self.components.signal_validator.validate(signal)
                 if valid:
                     approved = self.components.risk_validator.validate(signal)
-                if approved:
+                if approved and not blocked:
                     self.components.order_executor.execute(signal)
                     executed = True
             self.components.position_manager.manage()
             halted = self.components.portfolio_monitor.check()
             if halted:
                 self.state.transition(ApplicationState.HALTED)
-            return CycleResult(found, valid, approved, executed, halted)
+            return CycleResult(found, valid, approved, executed, halted, blocked)
         except EngineStateError:
             raise
         except Exception as exc:

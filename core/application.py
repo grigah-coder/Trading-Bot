@@ -19,6 +19,7 @@ from core.exceptions import (
 from core.market_calendar import ExchangeMarketCalendar, MarketSession
 from core.scheduler import MarketScheduler
 from core.state import ApplicationState, StateMachine
+from core.trading_gate import TradingGate
 
 
 class Scheduler(Protocol):
@@ -29,6 +30,12 @@ class Scheduler(Protocol):
         on_session_start: Callable[[MarketSession], None],
         evaluate: Callable[[], object],
     ) -> bool: ...
+
+
+class StartupReconciler(Protocol):
+    """Startup recovery contract used by the application lifecycle."""
+
+    def reconcile(self) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +96,8 @@ class TradingApplication:
         clock: Callable[[], datetime] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         recovery_policy: RecoveryPolicy | None = None,
+        trading_gate: TradingGate | None = None,
+        startup_reconciler: StartupReconciler | None = None,
     ) -> None:
         self.settings_loader = settings_loader
         self.component_factory = component_factory
@@ -100,6 +109,9 @@ class TradingApplication:
         self.recovery_policy = recovery_policy or RecoveryPolicy()
         self.settings: Settings | None = None
         self.engine: TradingEngine | None = None
+        self.trading_gate = trading_gate or TradingGate()
+        self.startup_reconciler = startup_reconciler
+        self.reconciliation_result: object | None = None
         self._shutdown_requested = False
 
     @property
@@ -113,7 +125,13 @@ class TradingApplication:
             self.settings = self.settings_loader()
             self.scheduler = self.scheduler_factory(self.settings)
             components = self.component_factory(self.settings)
-            self.engine = TradingEngine(components, state=self.state_machine)
+            self.engine = TradingEngine(
+                components,
+                state=self.state_machine,
+                trading_gate=self.trading_gate,
+            )
+            if self.startup_reconciler is not None:
+                self._reconcile_startup_state()
             self.engine.health_check()
             self.state_machine.transition(ApplicationState.RUNNING)
         except Exception as exc:
@@ -131,6 +149,26 @@ class TradingApplication:
 
     def request_shutdown(self) -> None:
         self._shutdown_requested = True
+
+    def _reconcile_startup_state(self) -> None:
+        """Run broker reconciliation and block trading when it is unsafe.
+
+        A reconciliation failure is a safety condition, not a startup failure:
+        the process may stay alive for monitoring and manual intervention while
+        the gate prevents any new order from being submitted.
+        """
+        try:
+            result = self.startup_reconciler.reconcile()  # type: ignore[union-attr]
+        except Exception as exc:
+            self.trading_gate.block("reconciliation", str(exc))
+            self.reconciliation_result = None
+            return
+        self.reconciliation_result = result
+        if not bool(getattr(result, "trading_allowed", False)):
+            detail = getattr(result, "error", None) or (
+                "startup reconciliation did not allow trading"
+            )
+            self.trading_gate.block("reconciliation", str(detail))
 
     def run_once(self, now: datetime | None = None) -> bool:
         if self.state is not ApplicationState.RUNNING:

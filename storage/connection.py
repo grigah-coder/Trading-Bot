@@ -37,11 +37,20 @@ def connect(url: str, *, factory: Callable[..., sqlite3.Connection] = sqlite3.Co
         directory = os.path.dirname(os.path.abspath(path))
         if directory:
             os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(path, factory=factory, check_same_thread=False)
+    # Autocommit mode: the database layer issues explicit BEGIN/COMMIT so a
+    # multi-statement trading operation can never be partially committed by an
+    # implicit sqlite3 transaction boundary.
+    conn = sqlite3.connect(
+        path,
+        factory=factory,
+        check_same_thread=False,
+        isolation_level=None,
+    )
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA busy_timeout = 5000")
+    conn.row_factory = sqlite3.Row
     return conn
 
 

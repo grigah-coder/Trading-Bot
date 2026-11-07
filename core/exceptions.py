@@ -58,3 +58,7 @@ class MarketCalendarError(TradingBotError):
 
 class RiskGateRequired(TradingBotError):
     code = "risk_gate_required"
+
+
+class TradingBlocked(TradingBotError):
+    code = "trading_blocked"
