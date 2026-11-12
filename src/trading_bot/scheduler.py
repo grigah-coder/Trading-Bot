@@ -14,10 +14,10 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 from trading_bot.state import AppState
 
-logger = configure_logging(__name__).getChild("scheduler")
+logger = get_logger(__name__)
 
 
 class Scheduler:
@@ -94,7 +94,9 @@ class Scheduler:
                 self.state.touch_heartbeat()
             except Exception as exc:  # noqa: BLE001 - keep loop alive
                 logger.error("Trading iteration failed: %s", exc, exc_info=True)
-                self.state.increment("errors") if hasattr(self.state, "increment") else None
+                recorder = getattr(self.state, "record_error", None)
+                if callable(recorder):
+                    recorder(f"scheduler iteration failed: {exc}")
             elapsed = time.monotonic() - start
             remaining = max(0.0, self.interval_seconds - elapsed)
             self._stop_event.wait(remaining)

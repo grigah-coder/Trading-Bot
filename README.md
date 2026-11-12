@@ -17,8 +17,8 @@ Live trading is never activated by this repository.
 * **No look-ahead bias** — data validation, freshness checks and timezone
   normalization prevent leakage; backtesting uses realistic execution,
   slippage, spreads and transaction costs.
-* **Observable** — structured logging, health checks and alerts; no API
-  credentials are ever written to logs.
+* **Observable** — structured logging, health checks and non-blocking alerts; no
+  API credentials are ever written to logs.
 
 ## Project structure
 
@@ -26,38 +26,37 @@ Live trading is never activated by this repository.
 Trading-Bot/
 ├── .env.example              # Copy to `.env` and fill in your own values
 ├── .gitignore
-├── pyproject.toml            # Packaging and lint configuration
-├── requirements.txt          # Runtime dependencies (minimal)
-├── requirements-dev.txt      # Dev / test dependencies
+├── LICENSE                   # MIT
 ├── README.md
-├── Dockerfile                # (optional) containerized paper-trading run
-├── config/                   # Configuration schemas
-├── data/                     # Historical / runtime market data (gitignored)
-├── logs/                     # Rotating logs (gitignored)
-├── scripts/                  # Helper scripts
+├── pyproject.toml            # Packaging, lint and coverage configuration
+├── requirements.txt          # Runtime dependencies
+├── requirements-dev.txt      # Dev / test dependencies
+├── data/                     # Runtime SQLite database (gitignored)
+├── logs/                     # Rotating logs and state files (gitignored)
 ├── src/trading_bot/
 │   ├── __init__.py
+│   ├── __main__.py           # Entry point: live loop and --backtest mode
 │   ├── exceptions.py         # Custom exception hierarchy
 │   ├── cache.py              # Thread-safe TTL cache
 │   ├── logging_config.py     # Structured rotating logger
-│   ├── order_state.py        # Thread-safe bracket-leg tracker
 │   ├── retry.py              # Retry / backoff with rate-limit handling
 │   ├── trade_ledger.py       # Persistent FIFO trade ledger
-│   ├── engine.py             # Central trading engine (Phase 2)
-│   ├── lifecycle.py          # Application lifecycle (Phase 2)
-│   ├── scheduler.py          # Scheduler (Phase 2)
-│   ├── state.py              # State management (Phase 2)
-│   ├── data/                 # Market data engine (Phase 3)
-│   ├── broker/               # Alpaca broker adapter (Phase 4)
-│   ├── risk/                 # Independent risk engine (Phase 5)
-│   ├── strategy/             # Strategy & signal engine (Phase 6)
-│   ├── order/                # Order lifecycle (Phase 7)
-│   ├── db/                   # Persistence (Phase 8)
-│   ├── backtest/             # Backtesting engine (Phase 9)
-│   └── monitoring/           # Health checks & alerts (Phase 11)
+│   ├── engine.py             # Central trading engine
+│   ├── lifecycle.py          # Start-up / graceful shutdown / signals
+│   ├── scheduler.py          # Trading-loop cadence
+│   ├── state.py              # Shared application state
+│   ├── backtest/             # Backtesting engine and metrics
+│   ├── broker/               # Alpaca broker adapter
+│   ├── config/               # Validated settings (paper-only)
+│   ├── data/                 # Market data, calendar and validation
+│   ├── db/                   # SQLite models, migrations and repository
+│   ├── monitoring/           # Health checks and alert notifiers
+│   ├── order/                # Order lifecycle and order manager
+│   ├── risk/                 # Independent risk engine and rules
+│   └── strategy/             # Strategy base, indicators and signals
 └── tests/
     ├── unit/                 # Unit tests
-    └── integration/          # Integration tests
+    └── integration/          # End-to-end pipeline tests
 ```
 
 ## Installation
@@ -86,31 +85,51 @@ Trading-Bot/
    # Never commit `.env`.
    ```
 
-5. Run the test suite:
-   ```bash
-   pytest -q
-   ```
+## Running
+
+All commands assume the virtual environment is active:
+
+```bash
+source venv/bin/activate
+```
+
+Run the paper-trading engine (requires paper credentials in `.env`):
+
+```bash
+python -m trading_bot
+```
+
+Run a one-off historical backtest through the same entry point:
+
+```bash
+python -m trading_bot --backtest
+```
+
+The engine runs until interrupted. `SIGINT`/`SIGTERM` trigger a graceful
+shutdown: the scheduler stops, open work is reconciled and monitoring is
+closed.
+
+## Testing and linting
+
+```bash
+# Tests
+pytest -q
+
+# Tests with coverage
+pytest -q --cov=trading_bot
+
+# Lint
+ruff check src tests
+```
 
 ## Operating mode
 
 The system defaults to paper trading. Set `ALPACA_PAPER=true` and
-`LIVE_TRADING_ENABLED=false` in `.env`. Live trading is disabled and must never
-be enabled.
+`LIVE_TRADING_ENABLED=false` in `.env`. Live trading is disabled by the settings
+validator and must never be enabled.
 
-## Development
+All percentage settings are fractions: `0.012` means 1.2%.
 
-The project is delivered in 12 phases. Phase 1 establishes the repository
-structure, configuration and cleanup. Subsequent phases implement the trading
-engine, market data, broker integration, risk engine, strategy, order
-management, persistence, backtesting, testing, monitoring and the final
-paper-trading release.
+## License
 
-Run lint:
-```bash
-ruff check src tests
-```
-
-Run tests:
-```bash
-pytest -q
-```
+MIT — see [LICENSE](LICENSE).

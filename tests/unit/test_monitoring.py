@@ -231,8 +231,90 @@ class TestBuildNotifier:
             telegram_chat_id = "-100123"
             telegram_timeout = 5.0
             telegram_retry_attempts = 1
+            alert_workers = 3
 
         n = build_notifier(S())
-        assert isinstance(n, TelegramNotifier)
-        assert n.token == "123:ABC"
-        assert n.chat_id == "-100123"
+        try:
+            assert isinstance(n, TelegramNotifier)
+            assert n.token == "123:ABC"
+            assert n.chat_id == "-100123"
+            assert n.alert_workers == 3
+        finally:
+            n.close()
+
+
+class TestBreakerSync:
+    """Mirroring the risk engine's breaker onto the health monitor."""
+
+    def test_set_circuit_breaker_is_quiet(self):
+        """Mirroring the risk breaker must not emit a second alert."""
+        notifier = RecordingNotifier()
+        monitor = HealthMonitor(notifier=notifier)
+        monitor.set_circuit_breaker(True, "risk halted")
+        health = monitor.health_check()
+
+        assert health["circuit_breaker_tripped"] is True
+        assert health["circuit_breaker_reason"] == "risk halted"
+        assert health["status"] == "halted"
+        assert notifier.sent == []
+
+    def test_set_circuit_breaker_resets(self):
+        """Resetting the breaker clears the reason and restores health."""
+        monitor = HealthMonitor()
+        monitor.set_circuit_breaker(True, "halted")
+        monitor.set_circuit_breaker(False)
+        health = monitor.health_check()
+        assert health["circuit_breaker_tripped"] is False
+        assert health["circuit_breaker_reason"] == ""
+
+
+class TestTelegramNotifierAsync:
+    """Telegram alerts are queued to worker threads, not sent inline."""
+
+    def test_notify_is_non_blocking_and_uses_plain_text(self):
+        """Delivery happens off-thread and without a Markdown parse mode."""
+        import threading
+        import time
+
+        started = threading.Event()
+        release = threading.Event()
+        sent: List[Dict[str, Any]] = []
+
+        class FakeResponse:
+            status_code = 200
+            text = ""
+
+        class BlockingSession:
+            def post(self, url, json=None, timeout=None):  # noqa: A002
+                started.set()
+                release.wait(2.0)
+                sent.append(json)
+                return FakeResponse()
+
+        notifier = TelegramNotifier(
+            "123:ABC", "-100", timeout=1.0, alert_workers=1,
+        )
+        notifier._session = BlockingSession()
+        try:
+            begin = time.monotonic()
+            notifier.notify("hello *world*", level="warning")
+            elapsed = time.monotonic() - begin
+            # The HTTP call is still blocked but notify returned immediately.
+            assert elapsed < 0.5
+            assert started.wait(1.0)
+
+            release.set()
+            assert notifier.flush(timeout=2.0)
+        finally:
+            release.set()
+            notifier.close()
+
+        assert len(sent) == 1
+        assert "parse_mode" not in sent[0]
+        assert sent[0]["text"] == "[WARNING] hello *world*"
+
+    def test_close_stops_workers(self):
+        """Closing the notifier joins every alert worker thread."""
+        notifier = TelegramNotifier("123:ABC", "-100", alert_workers=2)
+        notifier.close()
+        assert all(not thread.is_alive() for thread in notifier._threads)

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from alpaca.common.exceptions import APIError  # pyright: ignore[reportMissingImports]
 from alpaca.trading.enums import (  # pyright: ignore[reportMissingImports]
+    OrderClass,
     OrderSide,
     OrderType,
 )
@@ -131,6 +132,8 @@ def _adapter(settings=None):
         mock_client_cls.return_value = mock_client
         adapter = AlpacaBrokerAdapter(settings)
         adapter._client = mock_client
+        # Default: no order exists for a client_order_id (404 -> None).
+        mock_client.get_order_by_client_id.return_value = None
     return adapter, mock_client
 
 
@@ -305,16 +308,54 @@ def test_submit_limit_order():
     assert req.limit_price == 100.5
 
 
+def test_submit_bracket_order_builds_bracket_request():
+    """Bracket submission floors qty and attaches stop/TP requests."""
+    adapter, client = _adapter()
+    parent = _order("o-bracket", client_order_id="cid-1", qty=3,
+                    filled_qty=0, filled_avg_price=0, status="new")
+    parent.legs = [
+        _order("sl-1", client_order_id="cid-1", side="sell", qty=3,
+               filled_qty=0, filled_avg_price=0, order_type="stop",
+               status="held", stop_price=98.0),
+        _order("tp-1", client_order_id="cid-1", side="sell", qty=3,
+               filled_qty=0, filled_avg_price=0, order_type="limit",
+               status="held", limit_price=104.0),
+    ]
+    client.submit_order.return_value = parent
+
+    result = adapter.submit_bracket_order(
+        "AAPL", 3.7, "buy", 98.0, 104.0, client_order_id="cid-1",
+    )
+
+    assert result is not None
+    req = client.submit_order.call_args[0][0]
+    assert req.qty == 3.0  # floored to whole shares
+    assert req.order_class == OrderClass.BRACKET
+    assert req.stop_loss.stop_price == 98.0
+    assert req.take_profit.limit_price == 104.0
+    assert [leg["order_id"] for leg in result["legs"]] == ["sl-1", "tp-1"]
+
+
+def test_submit_bracket_order_rejects_sub_share_quantity():
+    """Less than one whole share is rejected, never rounded up."""
+    adapter, client = _adapter()
+    with pytest.raises(OrderRejectedError, match="at least 1 whole share"):
+        adapter.submit_bracket_order("AAPL", 0.5, "buy", 98.0, 104.0)
+    client.submit_order.assert_not_called()
+
+
 def test_submit_order_idempotent_when_exists():
     """A previous attempt may have succeeded; don't double-submit."""
     adapter, client = _adapter()
     existing = _order("o-existing", client_order_id="cid-1", status="filled")
-    client.get_orders.return_value = [existing]
+    client.get_order_by_client_id.return_value = existing
     client.submit_order.return_value = _order("o-new")
     result = adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
     assert result["order_id"] == "o-existing"
-    # submit_order must NOT have been called
+    # submit_order must NOT have been called, and no list query is needed.
     client.submit_order.assert_not_called()
+    client.get_orders.assert_not_called()
+    client.get_order_by_client_id.assert_called_once_with("cid-1")
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +368,14 @@ def test_submit_order_uncertain_timeout_checks_existing():
     client.submit_order.side_effect = err
     # An order with this client_order_id already exists -> treat as accepted
     existing = _order("o-existing", client_order_id="cid-1", status="filled")
-    client.get_orders.return_value = [existing]
+    client.get_order_by_client_id.side_effect = [
+        _api_error("not found", 404), existing,
+    ]
     result = adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
     assert result is not None
     assert result["order_id"] == "o-existing"
+    # Never retried: exactly one submission attempt.
+    assert client.submit_order.call_count == 1
 
 
 def test_submit_order_uncertain_timeout_no_existing_raises():
@@ -338,8 +383,55 @@ def test_submit_order_uncertain_timeout_no_existing_raises():
     adapter, client = _adapter()
     err = _api_error("timeout", 504)
     client.submit_order.side_effect = err
-    client.get_orders.return_value = []
+    client.get_order_by_client_id.side_effect = _api_error("not found", 404)
     with pytest.raises(BrokerUnavailableError):
+        adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
+    assert client.submit_order.call_count == 1
+
+
+def test_submit_does_not_retry_even_with_retry_attempts():
+    """A network timeout must not be retried by the retry policy."""
+    adapter, client = _adapter(_make_settings(retry_attempts=5))
+    client.submit_order.side_effect = TimeoutError("timed out")
+    client.get_order_by_client_id.side_effect = _api_error("not found", 404)
+    with pytest.raises(BrokerUnavailableError):
+        adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
+    assert client.submit_order.call_count == 1
+
+
+def test_submit_duplicate_client_order_id_returns_existing():
+    """A 422 duplicate is resolved by looking up the existing order."""
+    adapter, client = _adapter()
+    duplicate = _api_error(
+        "client_order_id must be unique: cid-1", 422,
+    )
+    client.submit_order.side_effect = duplicate
+    existing = _order("o-existing", client_order_id="cid-1", status="new")
+    client.get_order_by_client_id.side_effect = [
+        _api_error("not found", 404), existing,
+    ]
+    result = adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
+    assert result is not None
+    assert result["order_id"] == "o-existing"
+
+
+def test_submit_duplicate_without_existing_is_rejected():
+    """A duplicate 422 with no matching order stays a rejection."""
+    adapter, client = _adapter()
+    client.submit_order.side_effect = _api_error(
+        "client_order_id must be unique: cid-1", 422,
+    )
+    client.get_order_by_client_id.side_effect = _api_error("not found", 404)
+    with pytest.raises(OrderRejectedError):
+        adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
+
+
+def test_submit_non_broker_error_propagates_unchanged():
+    """Programming errors must not be disguised as broker outages."""
+    adapter, client = _adapter()
+    client.get_order_by_client_id.side_effect = _api_error("not found", 404)
+    client.submit_order.side_effect = ValueError("bad request object")
+    with pytest.raises(ValueError):
         adapter.submit_market_order("AAPL", 10, "buy", client_order_id="cid-1")
 
 

@@ -39,6 +39,7 @@ class Bar:
     timeframe: str
 
     def __post_init__(self) -> None:
+        """Validate prices, volume and OHLC consistency."""
         if self.timestamp.tzinfo is None:
             raise ValueError(f"bar timestamp must be timezone-aware: {self.timestamp!r}")
         if not math.isfinite(self.open) or self.open <= 0:
@@ -65,6 +66,7 @@ class Bar:
             raise ValueError(f"low {self.low} > high {self.high} for {self.symbol}")
 
     def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation of the bar."""
         return {
             "timestamp": self.timestamp.isoformat(),
             "open": self.open,

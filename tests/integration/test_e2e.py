@@ -21,8 +21,8 @@ from trading_bot.state import AppState
 # ---------------------------------------------------------------------------
 
 
-def _make_settings() -> Settings:
-    return Settings(
+def _make_settings(**overrides: Any) -> Settings:
+    values: Dict[str, Any] = dict(
         alpaca_api_key="key",
         alpaca_api_secret="secret",
         alpaca_paper=True,
@@ -38,11 +38,13 @@ def _make_settings() -> Settings:
         max_concurrent_positions=2,
         stop_loss_min_pct=0.01,
         stop_loss_max_pct=0.05,
-        stop_loss_pct=0.985,
-        take_profit_pct=1.04,
+        stop_loss_pct=0.012,
+        take_profit_pct=0.04,
         min_reward_risk_ratio=1.0,
         daily_loss_limit_enabled=False,
     )
+    values.update(overrides)
+    return Settings(**values)
 
 
 class _FakeDataProvider:
@@ -340,10 +342,14 @@ class TestRunIteration:
 
 
 class TestBuildComponentsSmoke:
-    def test_build_components_creates_all(self):
+    def test_build_components_creates_all(self, tmp_path):
         from trading_bot.__main__ import _build_components
 
-        settings = _make_settings()
+        settings = _make_settings(
+            db_path=str(tmp_path / "trading.sqlite"),
+            trade_ledger_file=str(tmp_path / "ledger.json"),
+            risk_state_file="",
+        )
         state = AppState()
         comps = _build_components(settings, state)
         expected = {
@@ -359,6 +365,9 @@ class TestBuildComponentsSmoke:
         assert comps["monitoring"].components["broker"] == comps[
             "broker_adapter"
         ].is_connected
-        assert comps["monitoring"].components["data"] == comps[
-            "data_provider"
-        ].is_market_open
+        # Data health is freshness, not "is the market open".
+        data_provider = comps["data_provider"]
+        data_provider.is_data_fresh = lambda symbol: symbol != "AAPL"
+        data_health = comps["monitoring"].components["data"]()
+        assert data_health["ok"] is False
+        assert data_health["stale_symbols"] == ["AAPL"]

@@ -11,21 +11,6 @@ import math
 from typing import List, Optional
 
 
-def _clean(prices: List[Optional[float]]) -> List[float]:
-    """Return finite prices, dropping None / non-finite entries (keeps order)."""
-    out: List[float] = []
-    for p in prices:
-        if p is None:
-            continue
-        try:
-            v = float(p)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(v):
-            out.append(v)
-    return out
-
-
 def sma(prices: List[Optional[float]], period: int) -> List[Optional[float]]:
     """Simple moving average.
 

@@ -7,9 +7,14 @@ retry policies and rate-limit handling.
 Implemented in Phase 3 (Market Data Engine).
 """
 
-from trading_bot.data.provider import AlpacaDataProvider
-from trading_bot.data.validation import Bar, DataValidationError, validate_bar, validate_bars
 from trading_bot.data.market_calendar import MarketCalendar
+from trading_bot.data.provider import AlpacaDataProvider
+from trading_bot.data.validation import (
+    Bar,
+    DataValidationError,
+    validate_bar,
+    validate_bars,
+)
 
 __all__ = [
     "AlpacaDataProvider",

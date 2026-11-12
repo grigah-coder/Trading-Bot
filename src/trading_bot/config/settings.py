@@ -15,7 +15,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+# Repo root: <root>/src/trading_bot/config/settings.py -> parents[3].
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 class TradingMode(str, Enum):
@@ -31,33 +35,25 @@ class BrokerMode(str, Enum):
 def _load_dotenv(path: Optional[str | Path] = None) -> Dict[str, str]:
     """Load ``KEY=value`` pairs from a ``.env`` file into ``os.environ``.
 
-    Existing environment variables are never overwritten. Returns the mapping
-    that was applied (only for keys not already present in the environment).
+    Defaults to the repo-root ``.env`` (not ``src/.env``). Existing
+    environment variables are never overwritten. Returns the mapping that was
+    applied (only keys not already present in the environment).
     """
     if path is None:
-        path = Path(__file__).resolve().parents[2] / ".env"
+        path = _REPO_ROOT / ".env"
     path = Path(path)
-    applied: Dict[str, str] = {}
     if not path.exists():
-        return applied
+        return {}
+
+    before = set(os.environ)
     try:
-        for raw in path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
-                applied[key] = value
-    except OSError:
-        # A missing or unreadable .env is not fatal; env vars may be set
-        # externally.
-        pass
-    return applied
+        load_dotenv(dotenv_path=path, override=False, encoding="utf-8")
+    except Exception:  # noqa: BLE001 - unreadable .env is non-fatal
+        return {}
+    return {
+        key: os.environ[key]
+        for key in os.environ.keys() - before
+    }
 
 
 def _env_list(value: Optional[str], default: List[str]) -> List[str]:
@@ -118,7 +114,6 @@ class Settings(BaseModel):
     # ------------------------------------------------------------------
     indicator_timeframe: str = Field(default="5 minutes")
     indicator_lookback: int = Field(default=200, ge=1)
-    min_bars_required: int = Field(default=60, ge=1)
 
     # ------------------------------------------------------------------
     # Market session / time filter (America/New_York)
@@ -136,34 +131,25 @@ class Settings(BaseModel):
     max_portfolio_risk_pct: float = Field(default=0.01, ge=0, le=1)
     max_shares_per_trade: int = Field(default=100, ge=0)
     max_concurrent_positions: int = Field(default=2, ge=0)
-    stop_loss_min_pct: float = Field(default=0.010, ge=0)
-    stop_loss_max_pct: float = Field(default=0.015, ge=0)
-    stop_loss_pct: float = Field(default=0.985)
-    take_profit_pct: float = Field(default=1.04, gt=0)
+    # All percentage values are fractions of price (0.012 == 1.2%).
+    stop_loss_min_pct: float = Field(default=0.010, gt=0, lt=1)
+    stop_loss_max_pct: float = Field(default=0.015, gt=0, lt=1)
+    stop_loss_pct: float = Field(default=0.012, gt=0, lt=1)
+    take_profit_pct: float = Field(default=0.04, gt=0, lt=1)
     min_reward_risk_ratio: float = Field(default=1.0, ge=0)
-    trailing_stop_enabled: bool = Field(default=True)
-    breakeven_trigger_pct: float = Field(default=0.005, ge=0)
-    breakeven_buffer_pct: float = Field(default=0.001, ge=0)
-    trailing_trigger_pct: float = Field(default=0.010, ge=0)
-    trailing_stop_pct: float = Field(default=0.008, ge=0)
     daily_loss_limit_enabled: bool = Field(default=True)
     daily_loss_limit_usd: float = Field(default=250.0, ge=0)
     daily_loss_limit_pct: float = Field(default=0.0025, ge=0, le=1)
-    bracket_fallback_to_market: bool = Field(default=False)
-    order_registration_timeout: float = Field(default=15.0, gt=0)
 
     # ------------------------------------------------------------------
     # Caching (seconds / entries)
     # ------------------------------------------------------------------
-    news_cache_ttl: float = Field(default=300.0, gt=0)
-    sentiment_cache_ttl: float = Field(default=300.0, gt=0)
     indicator_cache_ttl: float = Field(default=30.0, gt=0)
     cache_maxsize: int = Field(default=512, ge=1)
 
     # ------------------------------------------------------------------
     # Concurrency
     # ------------------------------------------------------------------
-    max_workers: int = Field(default=8, ge=1)
     alert_workers: int = Field(default=2, ge=1)
 
     # ------------------------------------------------------------------
@@ -183,7 +169,6 @@ class Settings(BaseModel):
     telegram_enabled: bool = Field(default=False)
     telegram_timeout: float = Field(default=5.0, gt=0)
     telegram_retry_attempts: int = Field(default=3, ge=1)
-    session_start_message_enabled: bool = Field(default=False)
 
     # ------------------------------------------------------------------
     # Persistence file paths (relative to project dir)
@@ -197,16 +182,9 @@ class Settings(BaseModel):
     # ------------------------------------------------------------------
     log_level: str = Field(default="INFO")
     log_dir: str = Field(default="logs")
-    log_file: str = Field(default="trading_bot.log")
+    log_file: str = Field(default="tradingbot.log")
     log_max_bytes: int = Field(default=5_000_000, gt=0)
     log_backup_count: int = Field(default=5, ge=0)
-
-    # ------------------------------------------------------------------
-    # Backtesting
-    # ------------------------------------------------------------------
-    is_backtesting: bool = Field(default=False)
-    backtest_start: str = Field(default="2024-01-01")
-    backtest_end: str = Field(default="2024-01-10")
 
     # ------------------------------------------------------------------
     # Validators
@@ -302,7 +280,6 @@ def load_settings(env_file: Optional[str | Path] = None) -> Settings:
         sleep_time=os.getenv("SLEEPTIME", "1M"),
         indicator_timeframe=os.getenv("INDICATOR_TIMEFRAME", "5 minutes"),
         indicator_lookback=int(os.getenv("INDICATOR_LOOKBACK", "200")),
-        min_bars_required=int(os.getenv("MIN_BARS_REQUIRED", "60")),
         time_filter_enabled=os.getenv("TIME_FILTER_ENABLED", "true").strip().lower() in {
             "1", "true", "yes", "y", "on",
         },
@@ -316,30 +293,16 @@ def load_settings(env_file: Optional[str | Path] = None) -> Settings:
         max_concurrent_positions=int(os.getenv("MAX_CONCURRENT_POSITIONS", "2")),
         stop_loss_min_pct=float(os.getenv("STOP_LOSS_MIN_PCT", "0.010")),
         stop_loss_max_pct=float(os.getenv("STOP_LOSS_MAX_PCT", "0.015")),
-        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "0.985")),
-        take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "1.04")),
+        stop_loss_pct=float(os.getenv("STOP_LOSS_PCT", "0.012")),
+        take_profit_pct=float(os.getenv("TAKE_PROFIT_PCT", "0.04")),
         min_reward_risk_ratio=float(os.getenv("MIN_REWARD_RISK_RATIO", "1.0")),
-        trailing_stop_enabled=os.getenv("TRAILING_STOP_ENABLED", "true").strip().lower() in {
-            "1", "true", "yes", "y", "on",
-        },
-        breakeven_trigger_pct=float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.005")),
-        breakeven_buffer_pct=float(os.getenv("BREAKEVEN_BUFFER_PCT", "0.001")),
-        trailing_trigger_pct=float(os.getenv("TRAILING_TRIGGER_PCT", "0.010")),
-        trailing_stop_pct=float(os.getenv("TRAILING_STOP_PCT", "0.008")),
         daily_loss_limit_enabled=os.getenv("DAILY_LOSS_LIMIT_ENABLED", "true").strip().lower() in {
             "1", "true", "yes", "y", "on",
         },
         daily_loss_limit_usd=float(os.getenv("DAILY_LOSS_LIMIT_USD", "250")),
         daily_loss_limit_pct=float(os.getenv("DAILY_LOSS_LIMIT_PCT", "0.0025")),
-        bracket_fallback_to_market=os.getenv("BRACKET_FALLBACK_TO_MARKET", "false").strip().lower() in {
-            "1", "true", "yes", "y", "on",
-        },
-        order_registration_timeout=float(os.getenv("ORDER_REGISTRATION_TIMEOUT", "15")),
-        news_cache_ttl=float(os.getenv("NEWS_CACHE_TTL", "300")),
-        sentiment_cache_ttl=float(os.getenv("SENTIMENT_CACHE_TTL", "300")),
         indicator_cache_ttl=float(os.getenv("INDICATOR_CACHE_TTL", "30")),
         cache_maxsize=int(os.getenv("CACHE_MAXSIZE", "512")),
-        max_workers=int(os.getenv("MAX_WORKERS", "8")),
         alert_workers=int(os.getenv("ALERT_WORKERS", "2")),
         retry_attempts=int(os.getenv("RETRY_ATTEMPTS", "4")),
         retry_base_delay=float(os.getenv("RETRY_BASE_DELAY", "1.0")),
@@ -355,20 +318,12 @@ def load_settings(env_file: Optional[str | Path] = None) -> Settings:
         },
         telegram_timeout=float(os.getenv("TELEGRAM_TIMEOUT", "5")),
         telegram_retry_attempts=int(os.getenv("TELEGRAM_RETRY_ATTEMPTS", "3")),
-        session_start_message_enabled=os.getenv(
-            "SESSION_START_MESSAGE_ENABLED", "false"
-        ).strip().lower() in {"1", "true", "yes", "y", "on"},
         risk_state_file=os.getenv("RISK_STATE_FILE", "logs/risk_state.json"),
         trade_ledger_file=os.getenv("TRADE_LEDGER_FILE", "logs/trade_ledger.json"),
         db_path=os.getenv("DB_PATH", "data/trading_bot.sqlite"),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
         log_dir=os.getenv("LOG_DIR", "logs"),
-        log_file=os.getenv("LOG_FILE", "trading_bot.log"),
+        log_file=os.getenv("LOG_FILE", "tradingbot.log"),
         log_max_bytes=int(os.getenv("LOG_MAX_BYTES", "5000000")),
         log_backup_count=int(os.getenv("LOG_BACKUP_COUNT", "5")),
-        is_backtesting=os.getenv("IS_BACKTESTING", "false").strip().lower() in {
-            "1", "true", "yes", "y", "on",
-        },
-        backtest_start=os.getenv("BACKTEST_START", "2024-01-01"),
-        backtest_end=os.getenv("BACKTEST_END", "2024-01-10"),
     )

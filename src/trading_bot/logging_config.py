@@ -11,10 +11,10 @@ name and thread name.
 
 Usage::
 
-    from trading_bot.logging_config import configure_logging
+    from trading_bot.logging_config import configure_logging, get_logger
 
     configure_logging()          # call once, early (idempotent)
-    logger = logging.getLogger(__name__)
+    logger = get_logger(__name__)
     logger.info("hello")
 """
 
@@ -56,7 +56,13 @@ def _coerce_level(level) -> int:
     return getattr(logging, str(level).upper(), logging.INFO)
 
 
+def get_logger(name: str) -> logging.Logger:
+    """Return the logger for ``name`` (normally ``__name__``)."""
+    return logging.getLogger(name)
+
+
 def configure_logging(
+    *,
     level=None,
     log_dir: Optional[str] = None,
     log_file: Optional[str] = None,
@@ -65,40 +71,44 @@ def configure_logging(
     quiet_libs: bool = True,
     force: bool = False,
 ) -> logging.Logger:
-    """Idempotently configure the root logger. Returns the root logger."""
+    """Idempotently configure the root logger. Returns the root logger.
+
+    Values come from :func:`trading_bot.config.settings.load_settings` unless
+    explicitly overridden. ``level`` is an int or a level name such as
+    ``"INFO"``; a module name must never be passed here.
+    """
     global _configured
 
     root = logging.getLogger()
     if _configured and not force:
         return root
 
-    # Import configuration lazily so this module can be configured before the
+    # Import configuration lazily so this module can be imported before the
     # application config module is available.
     resolved_level = logging.INFO
     log_dir = log_dir or "logs"
-    log_file = log_file or "trading_bot.log"
+    log_file = log_file or "tradingbot.log"
     max_bytes = max_bytes if max_bytes is not None else 5_000_000
     backup_count = backup_count if backup_count is not None else 5
     try:
-        from trading_bot.config import (  # type: ignore
-            LOG_BACKUP_COUNT,
-            LOG_DIR,
-            LOG_FILE,
-            LOG_LEVEL,
-            LOG_MAX_BYTES,
-        )
+        from trading_bot.config.settings import load_settings
 
-        resolved_level = _coerce_level(level if level is not None else LOG_LEVEL)
-        log_dir = log_dir or LOG_DIR
-        log_file = log_file or LOG_FILE
-        max_bytes = max_bytes if max_bytes is not None else LOG_MAX_BYTES
-        backup_count = backup_count if backup_count is not None else LOG_BACKUP_COUNT
+        settings = load_settings()
+        resolved_level = _coerce_level(
+            level if level is not None else settings.log_level
+        )
+        log_dir = log_dir or settings.log_dir
+        log_file = log_file or settings.log_file
+        max_bytes = (
+            max_bytes if max_bytes is not None else settings.log_max_bytes
+        )
+        backup_count = (
+            backup_count
+            if backup_count is not None
+            else settings.log_backup_count
+        )
     except Exception:  # pragma: no cover - config should always exist
         resolved_level = _coerce_level(level if level is not None else "INFO")
-        log_dir = log_dir or "logs"
-        log_file = log_file or "trading_bot.log"
-        max_bytes = max_bytes if max_bytes is not None else 5_000_000
-        backup_count = backup_count if backup_count is not None else 5
 
     # Reset any previously-attached handlers (e.g. when re-configuring).
     for handler in list(root.handlers):

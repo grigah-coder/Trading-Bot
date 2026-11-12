@@ -172,7 +172,7 @@ class TestMovingAverageCrossStrategy:
         buys = [s for s in signals if s["side"] == "buy"]
         assert len(buys) == 1
         assert buys[0]["symbol"] == "AAPL"
-        assert buys[0]["price"] == pytest.approx(sma(closes, 3)[-1])
+        assert buys[0]["price"] == pytest.approx(closes[-1])
         assert buys[0]["signal_id"].startswith("ma_cross:AAPL:buy:")
 
     def test_downtrend_emits_sell(self):

@@ -339,7 +339,11 @@ class TradeLedger:
             for position in positions or []:
                 symbol = str(position.get("symbol") or "").strip().upper()
                 qty = _as_float(position.get("qty"))
-                entry = _as_float(position.get("avg_entry"))
+                entry = _as_float(
+                    position.get("avg_entry_price")
+                    if position.get("avg_entry_price") is not None
+                    else position.get("avg_entry")
+                )
                 if not symbol or qty is None or entry is None:
                     continue
                 if qty <= _QTY_EPS or entry <= 0:

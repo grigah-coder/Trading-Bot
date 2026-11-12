@@ -10,11 +10,11 @@ from typing import Any, Dict, List, Optional
 
 from trading_bot.config.settings import Settings
 from trading_bot.exceptions import StrategyError
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 from trading_bot.strategy.base import Signal, Strategy
 from trading_bot.strategy.indicators import crossover, crossunder, ema, sma  # noqa: F401
 
-logger = configure_logging(__name__).getChild("signals")
+logger = get_logger(__name__)
 
 
 class MovingAverageCrossStrategy(Strategy):
@@ -52,7 +52,7 @@ class MovingAverageCrossStrategy(Strategy):
         *,
         fast_period: int = 10,
         slow_period: int = 30,
-        stop_loss_pct: float = 0.02,
+        stop_loss_pct: float = 0.012,
         take_profit_pct: float = 0.04,
         quantity: float = 10.0,
         strength: float = 1.0,
@@ -111,7 +111,8 @@ class MovingAverageCrossStrategy(Strategy):
             return None
 
         last_bar = symbol_bars[-1]
-        price = fast[-1] if fast[-1] is not None else slow[-1]
+        # Signals are priced at the last close, not at the fast SMA value.
+        price = closes[-1]
         if price is None or price <= 0:
             return None
 

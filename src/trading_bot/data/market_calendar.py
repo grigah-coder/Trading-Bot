@@ -12,7 +12,7 @@ the system more cautious (it will still block new trades outside the session).
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 
@@ -29,6 +29,7 @@ class MarketCalendar:
         market_close_time: str = "16:00",
         opening_blackout_minutes: int = 30,
     ) -> None:
+        """Create a calendar for the given session and timezone."""
         self.tz = ZoneInfo(market_timezone)
         open_h, open_m = _parse_hhmm(market_open_time)
         close_h, close_m = _parse_hhmm(market_close_time)
@@ -41,14 +42,14 @@ class MarketCalendar:
     # Session
     # ------------------------------------------------------------------
     def is_market_open(self, moment: Optional[datetime] = None) -> bool:
-        """True when the market is in regular session at ``moment``."""
+        """Return True when the market is in regular session at ``moment``."""
         moment = _to_market(moment or datetime.now(self.tz), self.tz)
         if moment.weekday() >= 5:  # Saturday/Sunday
             return False
         return self.market_open <= moment.time() < self.market_close
 
     def is_in_opening_blackout(self, moment: Optional[datetime] = None) -> bool:
-        """True during the opening-volatility blackout window after the open.
+        """Return True during the opening-volatility blackout after the open.
 
         New entries are suppressed here; protective exits are still allowed.
         """

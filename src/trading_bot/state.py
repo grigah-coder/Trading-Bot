@@ -114,6 +114,17 @@ class AppState:
                 raise AttributeError(f"unknown counter: {counter}")
             setattr(self, counter, current + amount)
 
+    def record_error(self, message: str) -> None:
+        """Append ``message`` to the shared error log (bounded)."""
+        text = str(message or "").strip()
+        if not text:
+            return
+        with self._lock:
+            self.errors.append(text)
+            # Keep memory bounded on long-running sessions.
+            if len(self.errors) > 1000:
+                del self.errors[:-1000]
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {

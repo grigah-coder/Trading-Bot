@@ -7,6 +7,8 @@ fail closed (block new trades) instead of failing open.
 
 from __future__ import annotations
 
+from typing import Optional
+
 
 class TradingBotError(Exception):
     """Base exception for all trading-bot errors."""
@@ -23,7 +25,7 @@ class CredentialsError(ConfigurationError):
 class MarketDataError(TradingBotError):
     """Raised when market data is unavailable, stale or failed validation."""
 
-    def __init__(self, message: str, symbol: Optional[str] = None) -> None:  # type: ignore[name-defined]
+    def __init__(self, message: str, symbol: Optional[str] = None) -> None:
         super().__init__(message)
         self.symbol = symbol
 
@@ -82,7 +84,3 @@ class StrategyError(TradingBotError):
 
 class BacktestError(TradingBotError):
     """Raised when backtesting assumptions are violated."""
-
-
-# `Optional` used above before its import; import it properly.
-from typing import Optional  # noqa: E402

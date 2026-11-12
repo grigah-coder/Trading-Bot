@@ -29,9 +29,7 @@ classifiers = [
 dependencies = [
     "alpaca-py>=0.45.0",
     "pandas>=2.0",
-    "numpy>=1.24",
     "python-dotenv>=1.0.0",
-    "PyYAML>=6.0",
     "requests>=2.31",
     "tzdata>=2023.4",
 ]
@@ -66,7 +64,7 @@ select = ["E", "F", "I", "N", "D", "B"]
 ignore = ["E501", "B008"]
 fixable = ["F", "I", "D"]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["trading_bot"]
 
 [tool.coverage.run]

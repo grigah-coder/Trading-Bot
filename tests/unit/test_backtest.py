@@ -7,7 +7,11 @@ from typing import Any, Dict, List, Optional
 
 import pytest
 
-from trading_bot.backtest.engine import BacktestConfig, BacktestEngine
+from trading_bot.backtest.engine import (
+    BacktestConfig,
+    BacktestEngine,
+    periods_per_year_for_timeframe,
+)
 from trading_bot.backtest.metrics import (
     cagr,
     expectancy,
@@ -93,10 +97,10 @@ class FakeRiskEngine:
         side = str(signal.get("side", "buy"))
         if side == "buy":
             stop_price = price * (1 - stop_pct)
-            limit_price = price * take_pct
+            limit_price = price * (1 + take_pct)
         else:
             stop_price = price * (1 + stop_pct)
-            limit_price = price * (2 - take_pct)
+            limit_price = price * (1 - take_pct)
         return {
             "approved": True,
             "qty": qty,
@@ -317,3 +321,309 @@ class TestBacktestEngine:
         ).run(bars, strategy, risk)
         # With costs, final equity should not be higher (usually lower or equal).
         assert costly.final_equity <= free.final_equity + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Backtest correctness regressions
+# ---------------------------------------------------------------------------
+
+
+class ScriptedStrategy:
+    """Emit fixed signals on selected history lengths (bar indexes)."""
+
+    def __init__(self, signals_by_index: Dict[int, List[Dict[str, Any]]]):
+        """Store the signal script keyed by history length."""
+        self.signals_by_index = signals_by_index
+
+    def generate_signals(
+        self, bars: Dict[str, List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """Return the signals scripted for each symbol's current history."""
+        out: List[Dict[str, Any]] = []
+        for symbol, symbol_bars in bars.items():
+            for signal in self.signals_by_index.get(len(symbol_bars), []):
+                if signal.get("symbol") in (None, symbol):
+                    out.append(dict(signal))
+        return out
+
+
+class PassThroughRisk:
+    """Approve every signal and honour explicit qty/stop/limit fields."""
+
+    def __init__(
+        self,
+        decisions: Optional[Dict[str, Dict[str, Any]]] = None,
+        reject_ids: Optional[List[str]] = None,
+    ):
+        """Configure per-signal overrides and rejected signal ids."""
+        self.decisions = decisions or {}
+        self.reject_ids = set(reject_ids or [])
+        self.assessed = 0
+
+    def is_halted(self) -> bool:
+        """Never halted, so every signal is assessed."""
+        return False
+
+    def assess(
+        self,
+        signal: Dict[str, Any],
+        account: Dict[str, Any],
+        positions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Approve the signal with its own qty/stop/limit or an override."""
+        self.assessed += 1
+        signal_id = signal.get("signal_id")
+        if signal_id in self.reject_ids:
+            return {"approved": False, "reason": "rejected"}
+        decision = {
+            "approved": True,
+            "qty": float(signal.get("quantity", 1.0)),
+            "stop_price": signal.get("stop_price"),
+            "limit_price": signal.get("limit_price"),
+        }
+        decision.update(self.decisions.get(signal_id, {}))
+        return decision
+
+
+def _signal(
+    symbol: str = "AAPL",
+    side: str = "buy",
+    quantity: float = 10.0,
+    price: float = 100.0,
+    stop_price: Optional[float] = None,
+    limit_price: Optional[float] = None,
+) -> Dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "quantity": quantity,
+        "stop_loss_pct": 0.01,
+        "take_profit_pct": 0.04,
+        "stop_price": stop_price,
+        "limit_price": limit_price,
+        "signal_id": f"sig-{symbol}-{side}",
+    }
+
+
+def _tbar(
+    symbol: str, close: float, high: float, low: float, open_price: float,
+    index: int,
+) -> Dict[str, Any]:
+    ts = (datetime(2024, 1, 1, tzinfo=timezone.utc)
+          + timedelta(minutes=5 * index)).isoformat()
+    return {
+        "timestamp": ts,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": 1000.0,
+        "symbol": symbol,
+        "timeframe": "5 minutes",
+    }
+
+
+def _single_symbol_outcome(
+    third_bar: Dict[str, Any],
+    stop_price: float,
+    limit_price: float,
+) -> Any:
+    """Buy on bar 1, then evaluate a scripted third bar."""
+    bars = {"AAPL": [
+        _tbar("AAPL", 100, 101, 99, 100, 0),
+        _tbar("AAPL", 100, 101, 99, 100, 1),
+        third_bar,
+    ]}
+    strategy = ScriptedStrategy({
+        1: [_signal(stop_price=stop_price, limit_price=limit_price)],
+    })
+    engine = BacktestEngine(BacktestConfig(
+        initial_capital=100_000.0,
+        commission_per_trade=0.0,
+        slippage_pct=0.0,
+        spread_pct=0.0,
+    ))
+    return engine.run(bars, strategy, PassThroughRisk())
+
+
+def test_gap_through_stop_fills_at_the_open():
+    """A bar gapping below the stop fills at the open, not the stop price."""
+    result = _single_symbol_outcome(
+        _tbar("AAPL", 91, 95, 88, 90, 2), stop_price=99.0,
+        limit_price=120.0,
+    )
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "stop_loss"
+    assert trade.exit_price == pytest.approx(90.0)
+
+
+def test_stop_wins_when_stop_and_target_hit_in_the_same_bar():
+    """Both protective levels touched -> conservative stop-first fill."""
+    result = _single_symbol_outcome(
+        _tbar("AAPL", 102, 106, 98, 100, 2), stop_price=99.0,
+        limit_price=105.0,
+    )
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "stop_loss"
+    assert trade.exit_price == pytest.approx(99.0)
+
+
+def test_take_profit_fills_at_the_target_price():
+    """A target touched intraday fills at the target, not the bar high."""
+    result = _single_symbol_outcome(
+        _tbar("AAPL", 108, 110, 100, 101, 2), stop_price=90.0,
+        limit_price=105.0,
+    )
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "take_profit"
+    assert trade.exit_price == pytest.approx(105.0)
+
+
+def test_gap_through_target_fills_at_the_open():
+    """A bar gapping above the target fills at the open."""
+    result = _single_symbol_outcome(
+        _tbar("AAPL", 112, 115, 108, 110, 2), stop_price=90.0,
+        limit_price=105.0,
+    )
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "take_profit"
+    assert trade.exit_price == pytest.approx(110.0)
+
+
+def test_sell_signal_never_opens_a_short():
+    """Long-only backtester: a sell with no position is a no-op."""
+    bars = {"AAPL": [
+        _tbar("AAPL", 100, 101, 99, 100, index) for index in range(3)
+    ]}
+    strategy = ScriptedStrategy({1: [_signal(side="sell")]})
+    engine = BacktestEngine(BacktestConfig(initial_capital=10_000.0))
+    result = engine.run(bars, strategy, PassThroughRisk())
+
+    assert result.orders_submitted == 0
+    assert result.orders_filled == 0
+    assert result.trades == []
+    assert result.final_equity == pytest.approx(10_000.0)
+
+
+def test_sell_signal_closes_an_existing_long():
+    """A sell signal exits a held long at the bar close (with costs)."""
+    bars = {"AAPL": [
+        _tbar("AAPL", 100, 101, 99, 100, 0),
+        _tbar("AAPL", 100, 101, 99, 100, 1),
+        _tbar("AAPL", 110, 111, 109, 110, 2),
+    ]}
+    strategy = ScriptedStrategy({
+        1: [_signal(stop_price=50.0, limit_price=200.0)],
+        2: [_signal(side="sell")],
+    })
+    engine = BacktestEngine(BacktestConfig(
+        initial_capital=100_000.0,
+        slippage_pct=0.0005,
+        spread_pct=0.0002,
+    ))
+    result = engine.run(bars, strategy, PassThroughRisk())
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_reason == "sell_signal"
+    assert trade.exit_price == pytest.approx(
+        110.0 * (1 - 0.0005) * (1 - 0.0002)
+    )
+    assert trade.side == "buy"
+
+
+def test_each_order_uses_its_own_risk_decision():
+    """Two approved signals must not share the last decision's qty."""
+    prices = [_tbar("AAPL", 100, 101, 99, 100, i) for i in range(3)]
+    other = [_tbar("MSFT", 100, 101, 99, 100, i) for i in range(3)]
+    bars = {"AAPL": prices, "MSFT": other}
+    strategy = ScriptedStrategy({
+        1: [
+            _signal("AAPL", quantity=10.0),
+            _signal("MSFT", quantity=10.0),
+        ],
+    })
+    risk = PassThroughRisk(decisions={
+        "sig-AAPL-buy": {"qty": 2.0},
+        "sig-MSFT-buy": {"qty": 7.0},
+    })
+    result = BacktestEngine(BacktestConfig(
+        initial_capital=100_000.0, periods_per_year=252.0,
+    )).run(bars, strategy, risk)
+
+    quantities = sorted(trade.quantity for trade in result.trades)
+    assert quantities == [2.0, 7.0]
+
+
+def test_exit_bar_belongs_to_the_exited_symbol():
+    """Closing one symbol must not stamp another symbol's bar on the trade."""
+    bars = {
+        "AAPL": [
+            _tbar("AAPL", 100, 101, 99, 100, 0),
+            _tbar("AAPL", 100, 101, 99, 100, 1),
+            _tbar("AAPL", 91, 95, 88, 90, 2),
+        ],
+        "MSFT": [
+            _tbar("MSFT", 100, 101, 99, 100, 0),
+            _tbar("MSFT", 100, 101, 99, 100, 1),
+            _tbar("MSFT", 100, 101, 99, 100, 2),
+        ],
+    }
+    strategy = ScriptedStrategy({
+        1: [
+            _signal("AAPL", stop_price=99.0, limit_price=200.0),
+            _signal("MSFT", stop_price=50.0, limit_price=200.0),
+        ],
+    })
+    result = BacktestEngine(BacktestConfig(
+        initial_capital=100_000.0, periods_per_year=252.0,
+    )).run(bars, strategy, PassThroughRisk())
+
+    aapl_trades = [t for t in result.trades if t.symbol == "AAPL"]
+    assert aapl_trades
+    assert aapl_trades[0].exit_reason == "stop_loss"
+    assert aapl_trades[0].exit_bar["symbol"] == "AAPL"
+    assert aapl_trades[0].exit_bar["low"] == pytest.approx(88.0)
+
+
+class TestPeriodsPerYear:
+    """Annualisation periods derived from bar timeframe."""
+
+    def test_timeframe_derivation(self):
+        """Intraday timeframes map to session bars per year."""
+        assert periods_per_year_for_timeframe("5 minutes") == pytest.approx(
+            78 * 252
+        )
+        assert periods_per_year_for_timeframe("1 hour") == pytest.approx(
+            6.5 * 252
+        )
+        assert periods_per_year_for_timeframe("1 day") == pytest.approx(252.0)
+        assert periods_per_year_for_timeframe("1 week") == pytest.approx(52.0)
+        assert periods_per_year_for_timeframe("bogus") == pytest.approx(252.0)
+
+    def test_config_override(self):
+        """An explicit config value beats timeframe derivation."""
+        result = BacktestEngine(
+            BacktestConfig(periods_per_year=100.0)
+        ).run({}, FakeStrategy(), FakeRiskEngine())
+        assert result.periods_per_year == pytest.approx(100.0)
+
+    def test_settings_timeframe_is_used(self):
+        """The configured indicator timeframe drives the default."""
+        from trading_bot.config.settings import Settings
+
+        settings = Settings(
+            alpaca_api_key="key",
+            alpaca_api_secret="secret",
+            risk_state_file="",
+            indicator_timeframe="5 minutes",
+        )
+        result = BacktestEngine(settings=settings).run(
+            {}, FakeStrategy(), FakeRiskEngine()
+        )
+        assert result.periods_per_year == pytest.approx(78 * 252)

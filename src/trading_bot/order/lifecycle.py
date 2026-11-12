@@ -16,10 +16,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from trading_bot.logging_config import configure_logging
-from trading_bot.order_state import STOP_LOSS, TAKE_PROFIT
+from trading_bot.logging_config import get_logger
 
-logger = configure_logging(__name__).getChild("lifecycle")
+logger = get_logger(__name__)
+
+# Protective bracket leg kinds.
+STOP_LOSS = "stop_loss"
+TAKE_PROFIT = "take_profit"
 
 # ---------------------------------------------------------------------------
 # Canonical statuses

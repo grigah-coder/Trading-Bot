@@ -32,6 +32,9 @@ class _FakeState:
 
 
 def _settings(**overrides: Any) -> Settings:
+    # Keep unit tests hermetic: no shared on-disk risk state unless a test
+    # explicitly opts in by passing risk_state_file.
+    overrides.setdefault("risk_state_file", "")
     return Settings(**overrides)
 
 
@@ -81,7 +84,7 @@ def _position(symbol: str = "AAPL", qty: float = 0.0) -> Dict[str, Any]:
 
 def _signal(symbol: str = "AAPL", side: str = "buy", price: float = 100.0,
             qty: float = 10.0, stop_pct: float = 0.02,
-            take_pct: float = 1.04) -> Dict[str, Any]:
+            take_pct: float = 0.04) -> Dict[str, Any]:
     return {
         "symbol": symbol,
         "side": side,
@@ -237,17 +240,17 @@ class TestStopLossBand:
 
 class TestRewardRisk:
     def test_acceptable_ratio_passes(self):
-        # stop 2%, take 4% -> reward/risk = (0.04-0)/0.02 = 2.0 >= 1.0
+        # stop 2%, take 4% -> reward/risk = 0.04/0.02 = 2.0 >= 1.0
         ok, _, _ = rules.check_reward_risk(
-            _signal(stop_pct=0.02, take_pct=1.04),
+            _signal(stop_pct=0.02, take_pct=0.04),
             _settings(min_reward_risk_ratio=1.0),
         )
         assert ok is True
 
     def test_below_minimum_rejected(self):
-        # stop 2%, take 1% -> ratio negative -> reject
+        # stop 2%, take 1% -> ratio 0.5 < 2.0 -> reject
         ok, reason, _ = rules.check_reward_risk(
-            _signal(stop_pct=0.02, take_pct=1.01),
+            _signal(stop_pct=0.02, take_pct=0.01),
             _settings(min_reward_risk_ratio=2.0),
         )
         assert ok is False
@@ -291,7 +294,7 @@ class TestRiskEngineHappyPath:
     def test_approves_valid_signal(self):
         engine = RiskEngine(_settings())
         decision = engine.assess(
-            _signal(price=100.0, qty=10, stop_pct=0.012, take_pct=1.04),
+            _signal(price=100.0, qty=10, stop_pct=0.012, take_pct=0.04),
             _account(equity=10000.0),
             [],
         )
@@ -381,3 +384,69 @@ class TestCircuitBreaker:
         engine.reset_daily()
         # fresh engine state; record_loss added 50 but reset cleared it
         assert engine._daily_loss_usd == 0.0
+
+
+class TestRiskStatePersistence:
+    """Daily loss and breaker state survive restarts via risk_state_file."""
+
+    def test_loss_is_persisted_and_reloaded(self, tmp_path):
+        """Daily loss survives a restart on the same trading day."""
+        path = str(tmp_path / "risk_state.json")
+        first = RiskEngine(_settings(risk_state_file=path))
+        first.record_loss(50.0)
+        assert first._daily_loss_usd == 50.0
+
+        second = RiskEngine(_settings(risk_state_file=path))
+        assert second._daily_loss_usd == 50.0
+        assert second.is_halted() is False
+
+    def test_halt_is_persisted_and_reloaded(self, tmp_path):
+        """A daily-loss halt is restored from disk after a restart."""
+        path = str(tmp_path / "risk_state.json")
+        first = RiskEngine(
+            _settings(risk_state_file=path, daily_loss_limit_usd=100.0),
+        )
+        first.record_loss(150.0)
+        assert first.is_halted() is True
+
+        second = RiskEngine(
+            _settings(risk_state_file=path, daily_loss_limit_usd=100.0),
+        )
+        assert second.is_halted() is True
+        assert "daily loss" in second._halt_reason
+
+    def test_new_trading_day_resets_daily_loss_and_halt(self, tmp_path):
+        """A stale date clears the loss budget and its halt."""
+        import json
+
+        path = tmp_path / "risk_state.json"
+        path.write_text(json.dumps({
+            "version": 1,
+            "date": "2000-01-01",
+            "daily_loss_usd": 200.0,
+            "halted": True,
+            "reason": "daily loss limit reached ($200.00)",
+        }))
+
+        engine = RiskEngine(_settings(risk_state_file=str(path)))
+        assert engine._daily_loss_usd == 0.0
+        assert engine.is_halted() is False
+
+    def test_same_day_state_is_preserved(self, tmp_path):
+        """Same-day persisted loss and manual halt are preserved."""
+        import json
+
+        path = tmp_path / "risk_state.json"
+        engine = RiskEngine(_settings(risk_state_file=str(path)))
+        today = engine._market_today()
+        path.write_text(json.dumps({
+            "version": 1,
+            "date": today,
+            "daily_loss_usd": 120.0,
+            "halted": True,
+            "reason": "manual halt",
+        }))
+
+        reloaded = RiskEngine(_settings(risk_state_file=str(path)))
+        assert reloaded._daily_loss_usd == 120.0
+        assert reloaded.is_halted() is True

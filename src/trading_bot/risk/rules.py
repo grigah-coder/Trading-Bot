@@ -168,7 +168,7 @@ def check_reward_risk(signal: Dict[str, Any], settings: Any) -> RuleResult:
             "rule": "reward_risk",
         }
     risk = price * stop_pct
-    reward = price * (take_pct - 1.0)
+    reward = price * take_pct
     if risk <= 0:
         return False, "non-positive risk", {"rule": "reward_risk"}
     ratio = reward / risk

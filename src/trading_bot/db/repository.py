@@ -29,10 +29,10 @@ from trading_bot.db.models import (
     SignalRecord,
     SystemEventRecord,
 )
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 from trading_bot.trade_ledger import TradeLedger
 
-logger = configure_logging(__name__).getChild("repository")
+logger = get_logger(__name__)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -116,7 +116,9 @@ class Repository:
             order_type=_as_str(order.get("order_type", "market")),
             status=_as_str(order.get("status", "pending_new")),
             filled_qty=_as_float(order.get("filled_qty")),
-            avg_fill_price=_as_float(order.get("filled_avg_price")),
+            avg_fill_price=_as_float(
+                order.get("avg_fill_price") or order.get("filled_avg_price")
+            ),
             stop_price=_as_optional_float(order.get("stop_price")),
             limit_price=_as_optional_float(order.get("limit_price")),
             time_in_force=_as_str(order.get("time_in_force", "day")),
@@ -140,7 +142,8 @@ class Repository:
             ),
         )
 
-    def save_fill(self, fill: Dict[str, Any]) -> None:
+    def save_fill(self, fill: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Persist a fill and return the trade-ledger result (``None`` if dup)."""
         rec = FillRecord(
             fill_id=_as_str(fill.get("fill_id") or fill.get("id")),
             order_id=_as_str(fill.get("order_id")),
@@ -163,7 +166,7 @@ class Repository:
         )
         # Also record in the FIFO trade ledger for realised-P/L tracking.
         try:
-            self._ledger.record_fill(
+            return self._ledger.record_fill(
                 symbol=rec.symbol,
                 side=rec.side,
                 quantity=rec.quantity,
@@ -172,6 +175,7 @@ class Repository:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Trade ledger write failed: %s", exc)
+            return None
 
     def save_position(self, position: Dict[str, Any]) -> None:
         rec = PositionRecord(
@@ -320,6 +324,55 @@ class Repository:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Database read failed: %s", exc)
                 return []
+            finally:
+                conn.close()
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Return persisted position snapshots ordered by symbol."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM positions ORDER BY symbol"
+                ).fetchall()
+                return [dict(r) for r in rows]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Database read failed: %s", exc)
+                return []
+            finally:
+                conn.close()
+
+    def prune_positions(self, open_symbols: Any) -> int:
+        """Delete persisted positions no longer held at the broker.
+
+        Returns the number of rows removed. An empty symbol set clears the
+        table, which is correct when the broker reports no open positions.
+        """
+        symbols = {
+            str(symbol).strip().upper()
+            for symbol in (open_symbols or ())
+            if str(symbol).strip()
+        }
+        with self._lock:
+            conn = self._connect()
+            try:
+                if symbols:
+                    placeholders = ",".join("?" for _ in symbols)
+                    cursor = conn.execute(
+                        f"DELETE FROM positions WHERE symbol NOT IN ({placeholders})",
+                        tuple(sorted(symbols)),
+                    )
+                else:
+                    cursor = conn.execute("DELETE FROM positions")
+                conn.commit()
+                return cursor.rowcount or 0
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Position prune failed: %s", exc)
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                return 0
             finally:
                 conn.close()
 

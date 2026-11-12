@@ -12,14 +12,50 @@ with slippage applied conservatively (buys filled higher, sells lower).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from trading_bot.backtest.metrics import summary_metrics
 from trading_bot.config.settings import Settings
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 
-logger = configure_logging(__name__).getChild("backtest")
+logger = get_logger(__name__)
+
+# Regular US equity session: 09:30-16:00 = 390 minutes per trading day.
+_MINUTES_PER_SESSION = 390.0
+_TRADING_DAYS_PER_YEAR = 252.0
+_TRADING_WEEKS_PER_YEAR = 52.0
+_TIMEFRAME_RE = re.compile(
+    r"^\s*([0-9]*\.?[0-9]+)?\s*"
+    r"(minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|wks?|w)\s*$"
+)
+
+
+def periods_per_year_for_timeframe(timeframe: Optional[str]) -> float:
+    """Return the number of bars in a trading year for ``timeframe``.
+
+    Bar counts assume the regular 6.5-hour US equity session, so e.g. a
+    ``"5 minutes"`` bar yields ``78 * 252 = 19656`` periods per year. Hourly
+    bars use 6.5 bars/session, daily bars 252/year and weekly bars 52/year.
+    Unrecognised formats fall back to 252 (daily).
+    """
+    text = str(timeframe or "").strip().lower()
+    if not text:
+        return _TRADING_DAYS_PER_YEAR
+    match = _TIMEFRAME_RE.match(text)
+    if not match:
+        return _TRADING_DAYS_PER_YEAR
+    amount = float(match.group(1) or 1.0)
+    if amount <= 0:
+        return _TRADING_DAYS_PER_YEAR
+    unit = match.group(2)
+    if unit.startswith("w"):
+        return _TRADING_WEEKS_PER_YEAR / amount
+    if unit.startswith("d"):
+        return _TRADING_DAYS_PER_YEAR / amount
+    minutes = amount * (60.0 if unit.startswith("h") else 1.0)
+    return (_MINUTES_PER_SESSION / minutes) * _TRADING_DAYS_PER_YEAR
 
 
 @dataclass
@@ -31,7 +67,9 @@ class BacktestConfig:
     commission_pct: float = 0.0                # fraction of notional per fill
     slippage_pct: float = 0.0005               # 0.05% conservative slippage
     spread_pct: float = 0.0002                 # 0.02% half-spread
-    periods_per_year: float = 252.0            # bars per year for annualised metrics
+    # Bars per year for annualised metrics. ``None`` derives it from the
+    # configured timeframe (see ``periods_per_year_for_timeframe``).
+    periods_per_year: Optional[float] = None
     max_concurrent_positions: Optional[int] = None  # override settings
     stop_loss_pct: Optional[float] = None      # override signal stop
     take_profit_pct: Optional[float] = None    # override signal take-profit
@@ -51,6 +89,7 @@ class BacktestTrade:
     exit_index: int
     entry_bar: Dict[str, Any] = field(default_factory=dict)
     exit_bar: Dict[str, Any] = field(default_factory=dict)
+    exit_reason: str = ""
 
     @property
     def pnl(self) -> float:
@@ -71,6 +110,7 @@ class BacktestTrade:
             "pnl": self.realised_pl,
             "entry_index": self.entry_index,
             "exit_index": self.exit_index,
+            "exit_reason": self.exit_reason,
         }
 
 
@@ -86,6 +126,7 @@ class BacktestResult:
     signals_rejected: int = 0
     orders_submitted: int = 0
     orders_filled: int = 0
+    periods_per_year: float = _TRADING_DAYS_PER_YEAR
     metrics: Dict[str, float] = field(default_factory=dict)
 
     @property
@@ -148,6 +189,15 @@ class BacktestEngine:
         """
         config = self.config
         result = BacktestResult(config=config)
+        periods_per_year = config.periods_per_year
+        if periods_per_year is None:
+            periods_per_year = periods_per_year_for_timeframe(
+                getattr(self.settings, "indicator_timeframe", None)
+                if self.settings is not None
+                else None
+            )
+        result.periods_per_year = float(periods_per_year)
+        periods_per_year = result.periods_per_year
 
         # Normalise and sort bars per symbol (oldest-first).
         symbol_bars: Dict[str, List[Dict[str, Any]]] = {}
@@ -162,7 +212,7 @@ class BacktestEngine:
 
         if not symbol_bars:
             logger.warning("Backtest received no usable bars")
-            result.metrics = summary_metrics([], [], config.periods_per_year)
+            result.metrics = summary_metrics([], [], periods_per_year)
             return result
 
         # Common time axis: iterate by index. At index i, history = bars[:i]
@@ -205,7 +255,9 @@ class BacktestEngine:
             }
             pos_list = list(positions.values())
 
-            approved: List[Dict[str, Any]] = []
+            # Approved signals are paired with the decision that approved
+            # each one; a decision is never reused across signals.
+            approved: List[tuple[Dict[str, Any], Dict[str, Any]]] = []
             for signal in signals:
                 try:
                     decision = risk_engine.assess(signal, account, pos_list)
@@ -214,13 +266,53 @@ class BacktestEngine:
                     result.signals_rejected += 1
                     continue
                 if decision.get("approved"):
-                    approved.append(signal)
+                    approved.append((signal, decision))
                     result.signals_approved += 1
                 else:
                     result.signals_rejected += 1
 
-            # 3. Submit approved orders (one entry per symbol).
-            for signal in approved:
+            # 3. Long-only: a sell signal exits an existing long, it never
+            #    opens a short. Exits fill at the current close with costs.
+            for signal, _decision in approved:
+                if str(signal.get("side", "buy")).strip().lower() != "sell":
+                    continue
+                symbol = str(signal.get("symbol", "")).upper()
+                pos = positions.get(symbol)
+                bar = current.get(symbol)
+                if pos is None or bar is None:
+                    continue
+                exit_price = self._market_fill_price(bar, "sell")
+                if exit_price is None:
+                    continue
+                cash = self._close_position(
+                    result, positions, symbol, exit_price, i, bar, cash,
+                    reason="sell_signal",
+                )
+
+            # 4. Check stop-loss / take-profit on open positions using the
+            #    current bar. Fill at the protective price, or at the open when
+            #    the bar gaps through it. If stop and target both trigger in
+            #    the same bar, the stop is assumed to fill first.
+            for symbol in list(positions):
+                pos = positions.get(symbol)
+                bar = current.get(symbol)
+                if pos is None or bar is None:
+                    continue
+                fill = self._protective_exit(pos, bar)
+                if fill is None:
+                    continue
+                exit_price, reason = fill
+                cash = self._close_position(
+                    result, positions, symbol, exit_price, i, bar, cash,
+                    reason=reason,
+                )
+
+            # 5. Submit approved buy orders and fill them at the current
+            #    close with conservative slippage. One entry per symbol.
+            for signal, decision in approved:
+                side = str(signal.get("side", "buy")).strip().lower()
+                if side != "buy":
+                    continue  # long-only: sells are exits, not entries
                 symbol = str(signal.get("symbol", "")).upper()
                 if symbol in positions:
                     continue  # already have a position in this symbol
@@ -236,7 +328,7 @@ class BacktestEngine:
                 order = {
                     "order_id": f"bt-{order_counter}",
                     "symbol": symbol,
-                    "side": str(signal.get("side", "buy")).lower(),
+                    "side": "buy",
                     "quantity": qty,
                     "order_type": "market",
                     "stop_price": decision.get("stop_price"),
@@ -247,66 +339,6 @@ class BacktestEngine:
                 open_orders.append(order)
                 result.orders_submitted += 1
 
-            # 4. Check stop-loss / take-profit on open positions using current
-            #    bar's high / low (conservative: worst price within the bar).
-            closed: List[Dict[str, Any]] = []
-            for symbol in list(positions):
-                pos = positions[symbol]
-                bar = current.get(symbol)
-                if bar is None:
-                    continue
-                high = float(bar.get("high", bar.get("close")))
-                low = float(bar.get("low", bar.get("close")))
-                exit_price: Optional[float] = None
-                exit_reason = ""
-                if pos["side"] == "buy":
-                    stop = pos.get("stop_price")
-                    if stop is not None and low <= stop:
-                        exit_price = min(stop, low)
-                        exit_reason = "stop_loss"
-                    tp = pos.get("limit_price")
-                    if exit_price is None and tp is not None and high >= tp:
-                        exit_price = max(tp, high)
-                        exit_reason = "take_profit"
-                else:  # sell
-                    stop = pos.get("stop_price")
-                    if stop is not None and high >= stop:
-                        exit_price = max(stop, high)
-                        exit_reason = "stop_loss"
-                    tp = pos.get("limit_price")
-                    if exit_price is None and tp is not None and low <= tp:
-                        exit_price = min(tp, low)
-                        exit_reason = "take_profit"
-                if exit_price is not None:
-                    closed.append((symbol, exit_price, exit_reason))
-
-            for symbol, exit_price, _reason in closed:
-                pos = positions.pop(symbol)
-                pl = self._realised_pl(pos, exit_price)
-                commission = self.commission_for(exit_price, pos["quantity"])
-                net_pl = pl - commission
-                result.trades.append(
-                    BacktestTrade(
-                        symbol=symbol,
-                        side=pos["side"],
-                        entry_price=pos["entry_price"],
-                        exit_price=exit_price,
-                        quantity=pos["quantity"],
-                        realised_pl=net_pl,
-                        entry_index=pos["entry_index"],
-                        exit_index=i,
-                        entry_bar=pos["entry_bar"],
-                        exit_bar=dict(bar),
-                    )
-                )
-                result.orders_filled += 1
-                cash += pos["quantity"] * exit_price - commission
-                logger.info(
-                    "Backtest %s %s exit @ %.4f pl=%.2f",
-                    symbol, pos["side"], exit_price, net_pl,
-                )
-
-            # 5. Fill new orders at current bar's close with slippage.
             still_open: List[Dict[str, Any]] = []
             for order in open_orders:
                 symbol = order["symbol"]
@@ -314,20 +346,10 @@ class BacktestEngine:
                 if bar is None:
                     still_open.append(order)
                     continue
-                close = float(bar.get("close", 0))
-                if close <= 0:
+                fill_price = self._market_fill_price(bar, order["side"])
+                if fill_price is None:
                     still_open.append(order)
                     continue
-                # Conservative slippage: buys fill higher, sells lower.
-                side = order["side"]
-                slip = config.slippage_pct
-                fill_price = close * (1.0 + slip) if side == "buy" else close * (1.0 - slip)
-                # Half-spread applied on top.
-                fill_price *= (
-                    1.0 + config.spread_pct
-                    if side == "buy"
-                    else 1.0 - config.spread_pct
-                )
                 qty = order["quantity"]
                 notional = qty * fill_price
                 commission = self.commission_for(fill_price, qty)
@@ -337,7 +359,7 @@ class BacktestEngine:
                     continue
                 positions[symbol] = {
                     "symbol": symbol,
-                    "side": side,
+                    "side": order["side"],
                     "quantity": qty,
                     "entry_price": fill_price,
                     "stop_price": order.get("stop_price"),
@@ -350,7 +372,7 @@ class BacktestEngine:
                 result.orders_filled += 1
                 logger.info(
                     "Backtest %s %s entry @ %.4f qty=%.4f comm=%.2f",
-                    symbol, side, fill_price, qty, commission,
+                    symbol, order["side"], fill_price, qty, commission,
                 )
 
             open_orders = still_open
@@ -377,26 +399,10 @@ class BacktestEngine:
             if bar is None:
                 continue
             exit_price = float(bar.get("close", pos["entry_price"]))
-            pl = self._realised_pl(pos, exit_price)
-            commission = self.commission_for(exit_price, pos["quantity"])
-            net_pl = pl - commission
-            result.trades.append(
-                BacktestTrade(
-                    symbol=symbol,
-                    side=pos["side"],
-                    entry_price=pos["entry_price"],
-                    exit_price=exit_price,
-                    quantity=pos["quantity"],
-                    realised_pl=net_pl,
-                    entry_index=pos["entry_index"],
-                    exit_index=max_len - 1,
-                    entry_bar=pos["entry_bar"],
-                    exit_bar=dict(bar),
-                )
+            cash = self._close_position(
+                result, positions, symbol, exit_price, max_len - 1, bar, cash,
+                reason="end_of_data",
             )
-            result.orders_filled += 1
-            cash += pos["quantity"] * exit_price - commission
-            positions.pop(symbol, None)
             equity_curve.append({
                 "index": max_len,
                 "timestamp": self._current_timestamp(last_bar),
@@ -410,7 +416,7 @@ class BacktestEngine:
         result.metrics = summary_metrics(
             [e["equity"] for e in equity_curve],
             [t.to_dict() for t in result.trades],
-            config.periods_per_year,
+            periods_per_year,
         )
         return result
 
@@ -434,6 +440,106 @@ class BacktestEngine:
         config = self.config
         notional = abs(price * qty)
         return config.commission_per_trade + config.commission_pct * notional
+
+    def _market_fill_price(
+        self, bar: Dict[str, Any], side: str,
+    ) -> Optional[float]:
+        """Return a close-price fill with conservative slippage/spread.
+
+        Buys fill higher and sells lower. Returns ``None`` when the bar has no
+        usable close price.
+        """
+        try:
+            close = float(bar.get("close", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if close <= 0:
+            return None
+        config = self.config
+        if side == "buy":
+            return close * (1.0 + config.slippage_pct) * (
+                1.0 + config.spread_pct
+            )
+        return close * (1.0 - config.slippage_pct) * (
+            1.0 - config.spread_pct
+        )
+
+    @staticmethod
+    def _protective_exit(
+        pos: Dict[str, Any], bar: Dict[str, Any],
+    ) -> Optional[tuple[float, str]]:
+        """Return ``(fill_price, reason)`` for a stop or take-profit hit.
+
+        Fills at the protective price, or at the bar's open when the bar gaps
+        through it. When both the stop and the target are touched in the same
+        bar, the stop is assumed to fill first (conservative).
+        """
+        try:
+            high = float(bar.get("high", bar.get("close")))
+            low = float(bar.get("low", bar.get("close")))
+            open_price = float(bar.get("open", bar.get("close")) or 0)
+        except (TypeError, ValueError):
+            return None
+        stop = pos.get("stop_price")
+        target = pos.get("limit_price")
+        if pos["side"] == "buy":
+            if stop is not None and low <= float(stop):
+                gap = open_price > 0 and open_price <= float(stop)
+                return (open_price if gap else float(stop)), "stop_loss"
+            if target is not None and high >= float(target):
+                gap = open_price > 0 and open_price >= float(target)
+                return (open_price if gap else float(target)), "take_profit"
+            return None
+        # Defensive short handling (the engine only opens longs).
+        if stop is not None and high >= float(stop):
+            gap = open_price > 0 and open_price >= float(stop)
+            return (open_price if gap else float(stop)), "stop_loss"
+        if target is not None and low <= float(target):
+            gap = open_price > 0 and open_price <= float(target)
+            return (open_price if gap else float(target)), "take_profit"
+        return None
+
+    def _close_position(
+        self,
+        result: BacktestResult,
+        positions: Dict[str, Dict[str, Any]],
+        symbol: str,
+        exit_price: float,
+        exit_index: int,
+        bar: Dict[str, Any],
+        cash: float,
+        reason: str,
+    ) -> float:
+        """Close ``symbol``, record the trade and return the new cash balance."""
+        pos = positions.pop(symbol, None)
+        if pos is None:
+            return cash
+        pl = self._realised_pl(pos, exit_price)
+        commission = self.commission_for(exit_price, pos["quantity"])
+        net_pl = pl - commission
+        result.trades.append(
+            BacktestTrade(
+                symbol=symbol,
+                side=pos["side"],
+                entry_price=pos["entry_price"],
+                exit_price=exit_price,
+                quantity=pos["quantity"],
+                realised_pl=net_pl,
+                entry_index=pos["entry_index"],
+                exit_index=exit_index,
+                entry_bar=pos.get("entry_bar", {}),
+                # Use the exited symbol's own bar, never the loop's last bar.
+                exit_bar=dict(bar) if bar else {},
+                exit_reason=reason,
+            )
+        )
+        result.orders_filled += 1
+        cash += pos["quantity"] * exit_price - commission
+        logger.info(
+            "Backtest %s %s exit @ %.4f pl=%.2f reason=%s",
+            symbol, pos["side"], exit_price, net_pl, reason,
+        )
+        return cash
 
     @staticmethod
     def _position_value(

@@ -88,3 +88,15 @@ def test_thread_safety():
 
     assert state.signals_generated == 1000
     state.stop()
+
+
+def test_record_error_appends_and_bounds():
+    """Errors are appended thread-safely and the list stays bounded."""
+    state = AppState()
+    state.record_error("boom")
+    assert state.errors == ["boom"]
+
+    for index in range(1100):
+        state.record_error(f"error-{index}")
+    assert len(state.errors) == 1000
+    assert state.snapshot()["error_count"] == 1000

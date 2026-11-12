@@ -39,8 +39,8 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit  # pyright: ignore[re
 from trading_bot.cache import TTLCache
 from trading_bot.config.settings import Settings
 from trading_bot.data.market_calendar import MarketCalendar
-from trading_bot.data.validation import Bar, DataValidationError, validate_bar, validate_bars
-from trading_bot.exceptions import DataStaleError, MarketDataError
+from trading_bot.data.validation import DataValidationError, validate_bar, validate_bars
+from trading_bot.exceptions import MarketDataError
 from trading_bot.logging_config import get_logger
 from trading_bot.retry import call_with_retry, is_retryable
 
@@ -84,6 +84,7 @@ class AlpacaDataProvider:
     """Alpaca-backed market data provider."""
 
     def __init__(self, settings: Settings, clock=None):
+        """Create the provider, wiring caches and the market calendar."""
         self.settings = settings
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._calendar = MarketCalendar(
@@ -212,9 +213,11 @@ class AlpacaDataProvider:
         return result
 
     def get_latest_trade(self, symbol: str) -> Optional[dict[str, Any]]:
+        """Return the latest trade for ``symbol`` (or ``None``)."""
         return self._get_latest_trade(str(symbol).upper())
 
     def get_latest_quote(self, symbol: str) -> Optional[dict[str, Any]]:
+        """Return the latest quote for ``symbol`` (or ``None``)."""
         symbol = str(symbol).upper()
         try:
             quote = call_with_retry(
@@ -234,13 +237,15 @@ class AlpacaDataProvider:
         return self._normalize_quote(quote, symbol)
 
     def is_market_open(self) -> bool:
+        """Return True when the regular session is currently open."""
         return self._calendar.is_market_open()
 
     def is_in_opening_blackout(self) -> bool:
+        """Return True inside the opening-volatility blackout window."""
         return self._calendar.is_in_opening_blackout()
 
     def is_data_fresh(self, symbol: str, max_age_minutes: float = 5.0) -> bool:
-        """True when the latest known bar/trade for ``symbol`` is recent enough."""
+        """Return True when the latest data for ``symbol`` is recent enough."""
         symbol = str(symbol).upper()
         cache_key = f"fresh:{symbol}:{max_age_minutes}"
         cached = self._freshness_cache.get(cache_key)

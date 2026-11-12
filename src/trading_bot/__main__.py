@@ -18,6 +18,9 @@ Wires every phase-1 through phase-11 component together:
 from __future__ import annotations
 
 import sys
+import time
+import uuid
+from typing import Any
 
 from trading_bot.backtest.engine import BacktestConfig, BacktestEngine
 from trading_bot.broker.adapter import AlpacaBrokerAdapter
@@ -25,15 +28,45 @@ from trading_bot.config.settings import Settings, load_settings
 from trading_bot.data.provider import AlpacaDataProvider
 from trading_bot.db.repository import Repository
 from trading_bot.engine import TradingEngine
-from trading_bot.logging_config import configure_logging
+from trading_bot.lifecycle import Lifecycle
+from trading_bot.logging_config import configure_logging, get_logger
 from trading_bot.monitoring.health import HealthMonitor
 from trading_bot.monitoring.notifier import build_notifier
 from trading_bot.order.manager import OrderManager
 from trading_bot.risk.engine import RiskEngine
+from trading_bot.scheduler import Scheduler
 from trading_bot.state import AppState
 from trading_bot.strategy.signals import MovingAverageCrossStrategy
 
-logger = configure_logging(__name__).getChild("main")
+logger = get_logger(__name__)
+
+# Default scheduler cadence when SLEEPTIME is missing or unparseable.
+_DEFAULT_SLEEP_SECONDS = 60.0
+_SLEEP_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0}
+
+
+def _parse_sleep_time(value: Any) -> float:
+    """Parse a ``SLEEPTIME`` value such as ``"1M"``/``"30S"`` into seconds.
+
+    A bare number is treated as seconds. Unknown or invalid values fall back
+    to one minute so a typo cannot spin the loop at full speed.
+    """
+    if isinstance(value, (int, float)):
+        return max(0.05, float(value))
+    text = str(value or "").strip().lower()
+    if not text:
+        return _DEFAULT_SLEEP_SECONDS
+    suffix = text[-1]
+    try:
+        if suffix in _SLEEP_UNITS:
+            return max(0.05, float(text[:-1]) * _SLEEP_UNITS[suffix])
+        return max(0.05, float(text))
+    except ValueError:
+        logger.warning(
+            "Invalid SLEEPTIME %r; falling back to %.0fs",
+            value, _DEFAULT_SLEEP_SECONDS,
+        )
+        return _DEFAULT_SLEEP_SECONDS
 
 
 def _build_components(settings, state: AppState):
@@ -63,9 +96,25 @@ def _build_components(settings, state: AppState):
     # --- Monitoring / alerting ------------------------------------------
     notifier = build_notifier(settings)
     monitoring = HealthMonitor(notifier=notifier)
+
+    def _data_health() -> dict:
+        """Report data health as freshness, not whether the market is open."""
+        stale: list[str] = []
+        for symbol in settings.watchlist:
+            try:
+                if not data_provider.is_data_fresh(symbol):
+                    stale.append(symbol)
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc)}
+        return {"ok": not stale, "stale_symbols": stale}
+
     monitoring.add_component("broker", broker_adapter.is_connected)
-    monitoring.add_component("data", data_provider.is_market_open)
+    monitoring.add_component("data", _data_health)
     monitoring.add_component("risk", lambda: not risk_engine.is_halted())
+    # The risk engine loads its persisted breaker state on construction;
+    # mirror that onto the monitor so health is correct before iteration 1.
+    if risk_engine.is_halted():
+        monitoring.set_circuit_breaker(True, "risk engine halted at startup")
 
     # Attach to state for cross-component visibility.
     state.data_provider = data_provider
@@ -89,6 +138,7 @@ def _build_components(settings, state: AppState):
 
 def main(backtest: bool = False) -> int:
     """Run the paper-trading engine (or a backtest when ``backtest`` is true)."""
+    configure_logging()
     settings = load_settings()
     logger.info(
         "Starting trading bot (mode=%s, paper=%s, backtest=%s)",
@@ -136,7 +186,31 @@ def main(backtest: bool = False) -> int:
         logger.critical("Validation failed: %s", exc)
         return 2
 
-    engine.run_forever()
+    monitoring = components["monitoring"]
+    scheduler = Scheduler(
+        state,
+        interval_seconds=_parse_sleep_time(settings.sleep_time),
+    )
+    lifecycle = Lifecycle(state)
+    lifecycle.on_stop(monitoring.close)
+    lifecycle.install_signal_handlers()
+
+    try:
+        # Recover fills/positions/orders before the first trading decision.
+        engine.reconcile_startup()
+        lifecycle.start(f"session-{uuid.uuid4().hex[:8]}")
+        scheduler.start(engine.run_iteration)
+        while state.is_running() and scheduler.is_running():
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    finally:
+        scheduler.stop()
+        try:
+            lifecycle.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lifecycle stop reported: %s", exc)
+        lifecycle.restore_signal_handlers()
     return 0
 
 

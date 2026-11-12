@@ -69,6 +69,11 @@ def is_rate_limit(exc: BaseException) -> bool:
     return "rate limit" in text or "too many requests" in text
 
 
+def is_network_error(exc: BaseException) -> bool:
+    """Return True for network-level failures (timeouts, resets, DNS)."""
+    return isinstance(exc, _NETWORK_ERRORS)
+
+
 def is_retryable(exc: BaseException) -> bool:
     """Decide whether an exception is worth retrying.
 

@@ -24,18 +24,27 @@ Safety rules:
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from alpaca.common.exceptions import APIError  # pyright: ignore[reportMissingImports]
 from alpaca.trading.client import TradingClient  # pyright: ignore[reportMissingImports]
-from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus, TimeInForce  # pyright: ignore[reportMissingImports]
+from alpaca.trading.enums import (  # pyright: ignore[reportMissingImports]
+    OrderClass,
+    OrderSide,
+    OrderType,
+    QueryOrderStatus,
+    TimeInForce,
+)
 from alpaca.trading.requests import (  # pyright: ignore[reportMissingImports]
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     ReplaceOrderRequest,
+    StopLossRequest,
+    TakeProfitRequest,
 )
 
 from trading_bot.config.settings import Settings
@@ -44,10 +53,10 @@ from trading_bot.exceptions import (
     BrokerUnavailableError,
     OrderRejectedError,
 )
-from trading_bot.logging_config import configure_logging
-from trading_bot.retry import call_with_retry, is_retryable
+from trading_bot.logging_config import get_logger
+from trading_bot.retry import call_with_retry, is_network_error, is_retryable
 
-logger = configure_logging(__name__).getChild("broker_adapter")
+logger = get_logger(__name__)
 
 # Canonical order states (normalized from Alpaca's varying strings).
 OPEN_STATES = frozenset(
@@ -90,8 +99,33 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _api_error_to_exception(exc: Exception, context: str) -> BrokerError:
-    """Map an Alpaca APIError to the most specific broker exception."""
+def _as_optional_float(value: Any) -> Optional[float]:
+    """Return ``None`` for absent prices instead of a fake ``0.0``."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_duplicate_client_order_id(exc: Exception) -> bool:
+    """True when the broker rejected an order as a duplicate client id."""
+    if not isinstance(exc, APIError) or getattr(exc, "status_code", None) != 422:
+        return False
+    text = str(exc).lower()
+    return "client_order_id" in text and (
+        "unique" in text or "duplicate" in text or "already" in text
+    )
+
+
+def _api_error_to_exception(exc: Exception, context: str) -> Exception:
+    """Translate broker/network failures; pass other errors through.
+
+    Only ``APIError`` responses and network-level failures become broker
+    exceptions. Programming errors (``ValueError``, ``TypeError``, ...) are
+    returned unchanged so bugs are not silently reported as broker outages.
+    """
     if isinstance(exc, APIError):
         code = getattr(exc, "status_code", None)
         message = str(exc)
@@ -104,7 +138,9 @@ def _api_error_to_exception(exc: Exception, context: str) -> BrokerError:
         if code in {408, 429, 500, 502, 503, 504} or is_retryable(exc):
             return BrokerUnavailableError(f"{context}: broker unavailable ({message})")
         return BrokerError(f"{context}: alpaca error ({message})")
-    return BrokerUnavailableError(f"{context}: {exc}")
+    if is_network_error(exc):
+        return BrokerUnavailableError(f"{context}: {exc}")
+    return exc
 
 
 class AlpacaBrokerAdapter:
@@ -268,6 +304,59 @@ class AlpacaBrokerAdapter:
             context="submit_limit_order",
         )
 
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        stop_price: float,
+        take_profit_price: Optional[float] = None,
+        *,
+        limit_price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
+        time_in_force: str = "day",
+    ) -> Optional[dict[str, Any]]:
+        """Submit a bracket order with attached stop-loss and take-profit legs.
+
+        Quantities are floored to whole shares; fractional or zero-share
+        brackets are rejected rather than rounded up. ``limit_price`` is
+        accepted as an alias for ``take_profit_price``.
+        """
+        if take_profit_price is None:
+            take_profit_price = limit_price
+        whole_qty = math.floor(_as_float(qty))
+        if whole_qty < 1:
+            raise OrderRejectedError(
+                f"bracket order for {symbol.upper()} requires at least 1 whole "
+                f"share, got {qty!r}"
+            )
+        if stop_price is None or take_profit_price is None:
+            raise OrderRejectedError(
+                f"bracket order for {symbol.upper()} requires both stop and "
+                "take-profit prices"
+            )
+        if client_order_id is None:
+            client_order_id = f"tb-{uuid.uuid4().hex}"
+        return self._submit_order(
+            MarketOrderRequest(
+                symbol=symbol.upper(),
+                qty=float(whole_qty),
+                side=OrderSide(side.lower()),
+                type=OrderType.MARKET,
+                time_in_force=TimeInForce(time_in_force),
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(
+                    limit_price=_as_float(take_profit_price),
+                ),
+                stop_loss=StopLossRequest(
+                    stop_price=_as_float(stop_price),
+                ),
+                client_order_id=client_order_id,
+            ),
+            client_order_id=client_order_id,
+            context="submit_bracket_order",
+        )
+
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order. Returns True when cancelled / already gone."""
         try:
@@ -361,16 +450,16 @@ class AlpacaBrokerAdapter:
         )
 
     def _submit_order(self, order_request, client_order_id: str, context: str):
-        """Submit an order with idempotency and uncertain-timeout safety.
+        """Submit an order once, resolving uncertain outcomes by lookup.
 
-        Before submitting, we check whether an order with the same
-        ``client_order_id`` already exists (a previous attempt may have
-        succeeded even though the response was lost). If so, we return that
-        order instead of double-submitting. After submission we do NOT blindly
-        retry on timeout: the caller must reconcile with broker state.
+        Submission itself is **never retried**: a timeout may have placed the
+        order already, and a blind retry would either double-fill or fail with
+        a duplicate-client-order-id 422. Instead, after an unavailable or
+        duplicate response we look the order up by ``client_order_id`` and
+        return it when it exists.
         """
         # Idempotency check: does this client_order_id already exist?
-        existing = self._find_by_client_order_id(client_order_id)
+        existing = self._get_order_by_client_id(client_order_id)
         if existing is not None:
             logger.info(
                 "[%s] order with client_order_id %s already exists; not resubmitting",
@@ -383,47 +472,53 @@ class AlpacaBrokerAdapter:
             order = self._call(
                 lambda: self._client.submit_order(order_request),
                 description=f"{context}[{order_request.symbol}]",
+                attempts=1,
             )
         except Exception as exc:  # noqa: BLE001
-            # Translate once. On an uncertain timeout (broker unavailable),
-            # check once for an existing order with this client_order_id
-            # before failing - never blindly retry and risk a double fill.
             broker_exc = _api_error_to_exception(
                 exc, f"{context}[{order_request.symbol}]"
             )
-            if isinstance(broker_exc, BrokerUnavailableError):
-                existing = self._find_by_client_order_id(client_order_id)
+            uncertain = isinstance(broker_exc, BrokerUnavailableError)
+            duplicate = _is_duplicate_client_order_id(exc)
+            if uncertain or duplicate:
+                existing = self._get_order_by_client_id(client_order_id)
                 if existing is not None:
                     logger.warning(
-                        "[%s] submission timed out but order %s already exists; "
-                        "treating as accepted (uncertain timeout handled "
-                        "idempotently)",
+                        "[%s] submission failed (%s) but order %s exists; "
+                        "treating as accepted",
                         order_request.symbol,
+                        "duplicate" if duplicate else "uncertain timeout",
                         client_order_id,
                     )
                     return existing
+            if broker_exc is exc:
+                raise
             raise broker_exc
 
         return self._normalize_order(order) if order is not None else None
 
-    def _find_by_client_order_id(self, client_order_id: str) -> Optional[dict[str, Any]]:
-        """Look up an order by client_order_id (idempotency key)."""
+    def _get_order_by_client_id(self, client_order_id: str) -> Optional[dict[str, Any]]:
+        """Return the order with ``client_order_id`` (``None`` when absent).
+
+        Uses the broker's dedicated lookup endpoint: one direct request instead
+        of two capped list queries. A 404 means "not found", which is the
+        normal case before submission.
+        """
         try:
-            orders = self.get_orders(status="open")
-        except Exception:  # noqa: BLE001 - unreadable state; caller decides
+            order = self._call(
+                lambda: self._client.get_order_by_client_id(client_order_id),
+                description=f"get_order_by_client_id[{client_order_id}]",
+            )
+        except Exception as exc:  # noqa: BLE001 - lookup is best effort
+            if isinstance(exc, APIError) and getattr(exc, "status_code", None) == 404:
+                return None
+            logger.warning(
+                "Could not look up client_order_id %s: %s", client_order_id, exc,
+            )
             return None
-        for order in orders:
-            if order.get("client_order_id") == client_order_id:
-                return order
-        # Also check closed orders for a recently filled idempotency key.
-        try:
-            orders = self.get_orders(status="closed")
-        except Exception:  # noqa: BLE001
+        if order is None:
             return None
-        for order in orders:
-            if order.get("client_order_id") == client_order_id:
-                return order
-        return None
+        return self._normalize_order(order)
 
     # ------------------------------------------------------------------
     # Normalization
@@ -488,6 +583,7 @@ class AlpacaBrokerAdapter:
         submitted_at = getattr(order, "submitted_at", None)
         filled_at = getattr(order, "filled_at", None)
         status = _normalize_status(getattr(order, "status", ""))
+        raw_legs = getattr(order, "legs", None) or []
         return {
             "order_id": str(getattr(order, "id", "")),
             "client_order_id": str(getattr(order, "client_order_id", "")),
@@ -498,6 +594,7 @@ class AlpacaBrokerAdapter:
             "filled_qty": filled_qty,
             "filled_avg_price": filled_avg_price,
             "order_type": _normalize_side(getattr(order, "order_type", "")),
+            "order_class": _normalize_side(getattr(order, "order_class", "")),
             "time_in_force": _normalize_side(getattr(order, "time_in_force", "")),
             "status": status,
             "is_open": status in OPEN_STATES,
@@ -505,8 +602,12 @@ class AlpacaBrokerAdapter:
             "is_filled": status == "filled",
             "is_cancelled": status in {"canceled", "cancelled"},
             "is_rejected": status == "rejected",
-            "limit_price": _as_float(getattr(order, "limit_price", None)),
-            "stop_price": _as_float(getattr(order, "stop_price", None)),
+            "limit_price": _as_optional_float(
+                getattr(order, "limit_price", None)
+            ),
+            "stop_price": _as_optional_float(
+                getattr(order, "stop_price", None)
+            ),
             "submitted_at": _to_iso(submitted_at),
             "filled_at": _to_iso(filled_at),
             "expired_at": _to_iso(getattr(order, "expired_at", None)),
@@ -515,6 +616,7 @@ class AlpacaBrokerAdapter:
             "replaced_at": _to_iso(getattr(order, "replaced_at", None)),
             "replaced_by": str(getattr(order, "replaced_by", "")) or None,
             "replaces": str(getattr(order, "replaces", "")) or None,
+            "legs": [self._normalize_order(leg) for leg in raw_legs],
             "raw": order,
         }
 

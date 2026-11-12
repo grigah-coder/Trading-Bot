@@ -3,8 +3,6 @@
 # resolved at install time. See requirements-dev.txt for dev/test tooling.
 alpaca-py>=0.45.0
 pandas>=2.0
-numpy>=1.24
 python-dotenv>=1.0.0
-PyYAML>=6.0
 requests>=2.31
 tzdata>=2023.4

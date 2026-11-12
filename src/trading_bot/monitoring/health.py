@@ -22,10 +22,10 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
 
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 from trading_bot.monitoring.notifier import Notifier
 
-logger = configure_logging(__name__).getChild("health")
+logger = get_logger(__name__)
 
 # Maximum number of recent alerts to keep in memory.
 _MAX_ALERTS = 500
@@ -164,6 +164,12 @@ class HealthMonitor:
     # ------------------------------------------------------------------
     # State mutation (used by engine / risk / order manager)
     # ------------------------------------------------------------------
+    def set_circuit_breaker(self, tripped: bool, reason: str = "") -> None:
+        """Mirror the risk engine's breaker state without emitting an alert."""
+        with self._lock:
+            self._circuit_breaker_tripped = bool(tripped)
+            self._circuit_breaker_reason = str(reason or "") if tripped else ""
+
     def trip_circuit_breaker(self, reason: str) -> None:
         with self._lock:
             self._circuit_breaker_tripped = True
@@ -198,6 +204,15 @@ class HealthMonitor:
     def recent_alerts(self, limit: int = 50) -> List[Dict[str, Any]]:
         with self._lock:
             return list(self._alerts)[-limit:]
+
+    def close(self) -> None:
+        """Release resources held by the notifier (e.g. alert workers)."""
+        closer = getattr(self.notifier, "close", None)
+        if callable(closer):
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Notifier shutdown failed: %s", exc)
 
     def snapshot(self) -> Dict[str, Any]:
         """Alias for :meth:`health_check` (kept for engine symmetry)."""

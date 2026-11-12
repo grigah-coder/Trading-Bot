@@ -12,7 +12,7 @@ Signal shape (dict form, consumed by the risk engine and order manager)::
         "side": "buy",                 # "buy" | "sell"
         "price": 150.25,               # reference price at signal time
         "quantity": 10.0,              # desired qty (risk engine may resize)
-        "stop_loss_pct": 0.02,         # fractional stop distance from price
+        "stop_loss_pct": 0.012,        # fractional stop distance from price
         "take_profit_pct": 0.04,       # fractional take-profit distance
         "signal_id": "sig-<uuid>",     # idempotency key
         "timestamp": "...iso...",      # tz-aware UTC
@@ -30,9 +30,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from trading_bot.exceptions import StrategyError
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 
-logger = configure_logging(__name__).getChild("base")
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)

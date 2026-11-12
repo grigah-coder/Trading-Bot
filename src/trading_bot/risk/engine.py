@@ -12,16 +12,25 @@ fails closed: when account/market state is uncertain it raises
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from trading_bot.config.settings import Settings
 from trading_bot.exceptions import RiskDataUnavailableError
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 from trading_bot.risk import rules
 
-logger = configure_logging(__name__).getChild("risk")
+logger = get_logger(__name__)
+
+
+def _is_daily_loss_reason(reason: str) -> bool:
+    """Return True when a halt reason came from the daily loss limit."""
+    return str(reason or "").strip().lower().startswith("daily loss")
 
 
 class RiskEngine:
@@ -50,6 +59,11 @@ class RiskEngine:
         self._halted_at: Optional[datetime] = None
         self._halt_reason = ""
         self._daily_loss_usd = 0.0
+        self._state_path = str(
+            getattr(settings, "risk_state_file", "") or ""
+        )
+        self._state_date = self._market_today()
+        self._load_state()
 
     # ------------------------------------------------------------------
     # Protocol
@@ -84,6 +98,8 @@ class RiskEngine:
             "stop_price": None,
             "limit_price": None,
         }
+
+        self._rollover_if_needed()
 
         with self._lock:
             if self._halted:
@@ -190,10 +206,10 @@ class RiskEngine:
         )
         if side == "buy":
             stop_price = price * (1.0 - stop_pct)
-            limit_price = price * take_pct
+            limit_price = price * (1.0 + take_pct)
         else:
             stop_price = price * (1.0 + stop_pct)
-            limit_price = price * (2.0 - take_pct)
+            limit_price = price * (1.0 - take_pct)
 
         decision["approved"] = True
         decision["reason"] = "approved"
@@ -226,6 +242,7 @@ class RiskEngine:
         """
         loss = abs(rules._as_float(usd))
         with self._lock:
+            self._state_date = self._market_today()
             self._daily_loss_usd += loss
             equity = 0.0
             if self.state is not None:
@@ -240,11 +257,15 @@ class RiskEngine:
                     True,
                     f"daily loss limit reached (${self._daily_loss_usd:.2f})",
                 )
+            else:
+                self._persist_locked()
 
     def reset_daily(self) -> None:
         """Reset the in-session daily loss tracker (call at session start)."""
         with self._lock:
             self._daily_loss_usd = 0.0
+            self._state_date = self._market_today()
+            self._persist_locked()
 
     def trip_circuit_breaker(self, reason: str) -> None:
         """Trip the circuit breaker, halting new entries."""
@@ -257,6 +278,103 @@ class RiskEngine:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+    def _market_today(self) -> str:
+        """Return the current date in the configured market timezone."""
+        tz_name = str(
+            getattr(self.settings, "market_timezone", "") or "UTC"
+        )
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:  # noqa: BLE001 - unknown tz falls back to UTC
+            tz = timezone.utc
+        return datetime.now(tz).date().isoformat()
+
+    def _load_state(self) -> None:
+        """Load persisted daily-loss / breaker state, resetting on a new day."""
+        if not self._state_path or not os.path.exists(self._state_path):
+            return
+        try:
+            with open(self._state_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:  # noqa: BLE001 - corrupt state is non-fatal
+            logger.warning(
+                "Could not read risk state %s: %s", self._state_path, exc,
+            )
+            return
+        if not isinstance(payload, dict):
+            return
+
+        today = self._market_today()
+        self._daily_loss_usd = max(
+            0.0, rules._as_float(payload.get("daily_loss_usd")),
+        )
+        self._halted = bool(payload.get("halted"))
+        self._halt_reason = str(payload.get("reason") or "")
+        self._state_date = str(payload.get("date") or today)
+
+        if self._state_date != today:
+            # New trading day: yesterday's loss budget and its halt expire.
+            self._daily_loss_usd = 0.0
+            self._state_date = today
+            if self._halted and _is_daily_loss_reason(self._halt_reason):
+                self._halted = False
+                self._halt_reason = ""
+            self._persist_locked()
+
+        if self._halted:
+            self._halted_at = datetime.now(timezone.utc)
+            if self.state is not None:
+                try:
+                    self.state.trip_circuit_breaker(self._halted_at)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _persist_locked(self) -> None:
+        """Atomically write daily-loss / breaker state to ``risk_state_file``."""
+        if not self._state_path:
+            return
+        payload = {
+            "version": 1,
+            "date": self._state_date,
+            "daily_loss_usd": round(self._daily_loss_usd, 6),
+            "halted": self._halted,
+            "reason": self._halt_reason,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        directory = os.path.dirname(os.path.abspath(self._state_path)) or "."
+        tmp_path = ""
+        try:
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".risk_state.", suffix=".tmp", dir=directory,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._state_path)
+        except Exception as exc:  # noqa: BLE001 - never break trading
+            logger.warning(
+                "Could not save risk state %s: %s", self._state_path, exc,
+            )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _rollover_if_needed(self) -> None:
+        """Reset daily loss (and its halt) when the market date changes."""
+        with self._lock:
+            today = self._market_today()
+            if today == self._state_date:
+                return
+            self._daily_loss_usd = 0.0
+            self._state_date = today
+            if self._halted and _is_daily_loss_reason(self._halt_reason):
+                self._halt(False, "")
+            else:
+                self._persist_locked()
+
     def _halt(self, halted: bool, reason: str) -> None:
         with self._lock:
             self._halted = halted
@@ -272,6 +390,7 @@ class RiskEngine:
                         self.state.reset_circuit_breaker()
                 except Exception:  # noqa: BLE001
                     pass
+            self._persist_locked()
         if halted:
             logger.warning("Circuit breaker tripped: %s", reason)
         else:

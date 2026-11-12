@@ -13,10 +13,10 @@ import signal
 import threading
 from typing import Callable, Optional
 
-from trading_bot.logging_config import configure_logging
+from trading_bot.logging_config import get_logger
 from trading_bot.state import AppState
 
-logger = configure_logging(__name__).getChild("lifecycle")
+logger = get_logger(__name__)
 
 
 class Lifecycle:
